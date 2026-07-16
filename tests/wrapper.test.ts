@@ -1,6 +1,9 @@
 import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 // Drive the actual MCP wrapper (notion_execute / notion_describe) through an
 // in-memory transport pair. This catches plumbing bugs that the unit-level
@@ -19,6 +22,7 @@ const notionStub = {
   },
   comments: { retrieve: vi.fn(), update: vi.fn(), delete: vi.fn() },
   blocks: { children: { append: vi.fn() } },
+  fileUploads: { create: vi.fn(), send: vi.fn(), complete: vi.fn() },
 };
 
 vi.mock("../src/services/notion.js", () => ({
@@ -70,6 +74,41 @@ describe("MCP wrapper: listTools", () => {
     const names = tools.map((t) => t.name);
     expect(names).toContain("notion_execute");
     expect(names).toContain("notion_describe");
+    expect(names).toContain("notion_upload_file");
+    const upload = tools.find((tool) => tool.name === "notion_upload_file");
+    expect(upload?.inputSchema.properties?.file).toMatchObject({ type: "string", format: "file" });
+  });
+});
+
+describe("MCP wrapper: notion_upload_file", () => {
+  it("reads a transferred path and uploads the file bytes", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "notion-mcp-upload-"));
+    const path = join(dir, "probe.pdf");
+    await writeFile(path, Buffer.from("%PDF-1.4\nprobe"));
+    notionStub.fileUploads.create.mockResolvedValue({ id: "fu-probe" });
+    notionStub.fileUploads.send.mockResolvedValue({
+      id: "fu-probe",
+      status: "uploaded",
+      filename: "probe.pdf",
+      content_type: "application/pdf",
+    });
+    try {
+      const result = await client.callTool({
+        name: "notion_upload_file",
+        arguments: { file: path },
+      });
+      expect(result.isError).toBeFalsy();
+      expect(readJson(result as Parameters<typeof readJson>[0])).toMatchObject({
+        ok: true,
+        file_upload_id: "fu-probe",
+        filename: "probe.pdf",
+        content_type: "application/pdf",
+        attached: false,
+      });
+      expect(notionStub.fileUploads.send).toHaveBeenCalled();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });
 

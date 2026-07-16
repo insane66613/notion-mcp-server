@@ -1,5 +1,8 @@
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
+import { readFile, stat } from "node:fs/promises";
+import { basename, extname } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { readNotionResource } from "./resources.js";
@@ -55,6 +58,50 @@ Most responses are slimmed by default. Pass verbose:true inside payload (single)
 
 const DESCRIBE_DESCRIPTION = `Return the JSON Schema and a working example for one operation. Use this BEFORE notion_execute when the payload shape is non-trivial (query filters, structured block trees, database property definitions). For simple ops, just call notion_execute — its errors carry the schema.`;
 
+const CONNECTOR_FILE = z
+  .string()
+  .meta({ format: "file" })
+  .describe(
+    "A user-supplied file transferred by the MCP client. Use this top-level argument for ChatGPT /mnt/data uploads."
+  );
+
+const CONNECTOR_FILE_MAX_BYTES = Number.parseInt(
+  process.env.NOTION_CONNECTOR_FILE_MAX_BYTES ?? String(100 * 1024 * 1024),
+  10
+);
+
+const CONNECTOR_MIME_BY_EXTENSION: Record<string, string> = {
+  ".csv": "text/csv",
+  ".gif": "image/gif",
+  ".jpeg": "image/jpeg",
+  ".jpg": "image/jpeg",
+  ".json": "application/json",
+  ".pdf": "application/pdf",
+  ".png": "image/png",
+  ".txt": "text/plain",
+  ".webp": "image/webp",
+};
+
+function connectorPath(file: string): string {
+  const trimmed = file.trim();
+  return trimmed.startsWith("file://") ? fileURLToPath(trimmed) : trimmed;
+}
+
+function connectorContentType(filename: string, supplied?: string): string | undefined {
+  const explicit = supplied?.trim();
+  if (explicit) return explicit;
+  return CONNECTOR_MIME_BY_EXTENSION[extname(filename).toLowerCase()];
+}
+
+function fileBlockType(contentType: string | undefined): "pdf" | "image" | "audio" | "video" | "file" {
+  if (contentType === "application/pdf") return "pdf";
+  if (contentType?.startsWith("image/")) return "image";
+  if (contentType?.startsWith("audio/")) return "audio";
+  if (contentType?.startsWith("video/")) return "video";
+  return "file";
+}
+
+
 export function registerAllTools(server: McpServer): void {
   server.registerTool(
     "notion_execute",
@@ -76,6 +123,129 @@ export function registerAllTools(server: McpServer): void {
       const isBatch = typeof result === "object" && result !== null && "summary" in result;
       if (isBatch || result.ok) return jsonContent(result);
       return errorContent(result);
+    }
+  );
+
+  server.registerTool(
+    "notion_upload_file",
+    {
+      title: "Upload File to Notion",
+      description:
+        "Upload a ChatGPT-supplied file through Notion's file_uploads API. Optionally pass page_id to append the uploaded file as a real Notion file/PDF block in the same call.",
+      inputSchema: {
+        file: CONNECTOR_FILE,
+        page_id: z.string().optional().describe("Optional target Notion page or block id."),
+        filename: z.string().optional().describe("Optional filename override."),
+        content_type: z.string().optional().describe("Optional MIME type override, such as application/pdf."),
+        caption: z.string().optional().describe("Optional caption when page_id is supplied."),
+      },
+      annotations: {
+        title: "Upload File to Notion",
+        readOnlyHint: false,
+        destructiveHint: false,
+        openWorldHint: true,
+      },
+    },
+    async ({ file, page_id, filename, content_type, caption }): Promise<CallToolResult> => {
+      if (!isOperationAllowed("upload_file")) {
+        return errorContent({ ok: false, error: operationNotAllowedError("upload_file") });
+      }
+      if (page_id && !isOperationAllowed("append_blocks")) {
+        return errorContent({ ok: false, error: operationNotAllowedError("append_blocks") });
+      }
+
+      try {
+        const path = connectorPath(file);
+        const info = await stat(path);
+        if (!info.isFile()) {
+          return errorContent({
+            ok: false,
+            error: { code: "invalid_file", message: `Transferred path is not a file: ${path}` },
+          });
+        }
+        if (info.size > CONNECTOR_FILE_MAX_BYTES) {
+          return errorContent({
+            ok: false,
+            error: {
+              code: "file_too_large",
+              message: `Transferred file is ${info.size} bytes; maximum is ${CONNECTOR_FILE_MAX_BYTES} bytes.`,
+            },
+          });
+        }
+
+        const bytes = await readFile(path);
+        const effectiveFilename = filename?.trim() || basename(path);
+        const effectiveType = connectorContentType(effectiveFilename, content_type);
+        const upload = await dispatch("upload_file", {
+          mode: bytes.byteLength > 5 * 1024 * 1024 ? "multi" : "single",
+          filename: effectiveFilename,
+          ...(effectiveType ? { content_type: effectiveType } : {}),
+          source: { type: "base64", data: bytes.toString("base64") },
+        });
+        if (!upload.ok) return errorContent(upload);
+
+        const uploadData = ("data" in upload ? upload.data : undefined) as
+          | Record<string, unknown>
+          | undefined;
+        const fileUploadId = String(uploadData?.file_upload_id ?? "");
+        if (!fileUploadId) {
+          return errorContent({
+            ok: false,
+            upload,
+            error: { code: "missing_file_upload_id", message: "Notion uploaded the bytes but returned no file_upload_id." },
+          });
+        }
+
+        let attachment: unknown = null;
+        if (page_id) {
+          const blockType = fileBlockType(effectiveType);
+          const richCaption = caption?.trim()
+            ? [{ type: "text", text: { content: caption.trim() } }]
+            : [];
+          const child = {
+            object: "block",
+            type: blockType,
+            [blockType]: {
+              type: "file_upload",
+              file_upload: { id: fileUploadId },
+              caption: richCaption,
+            },
+          };
+          attachment = await dispatch("append_blocks", {
+            block_id: page_id,
+            children: [child],
+          });
+          if (!(attachment as { ok?: boolean }).ok) {
+            return errorContent({
+              ok: false,
+              upload,
+              attachment,
+              error: {
+                code: "file_uploaded_but_not_attached",
+                message: "The file upload completed, but appending the Notion block failed.",
+              },
+            });
+          }
+        }
+
+        return jsonContent({
+          ok: true,
+          filename: effectiveFilename,
+          content_type: effectiveType ?? "",
+          size: bytes.byteLength,
+          file_upload_id: fileUploadId,
+          page_id: page_id ?? "",
+          attached: Boolean(page_id),
+          upload,
+          attachment,
+        });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return errorContent({
+          ok: false,
+          error: { code: "connector_file_upload_failed", message },
+        });
+      }
     }
   );
 
