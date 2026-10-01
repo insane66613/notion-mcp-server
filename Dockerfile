@@ -4,7 +4,7 @@
 # tag) so the registry can't swap the contents under us. Dependabot's docker
 # ecosystem bumps this digest in a reviewed PR. Resolve a new one with:
 #   docker buildx imagetools inspect node:24-alpine
-FROM node:24-alpine@sha256:156b55f92e98ccd5ef49578a8cea0df4679826564bad1c9d4ef04462b9f0ded6 AS builder
+FROM node:24-alpine@sha256:e67514e5d0f6c46656005e1b693b2ec9d52e80b641307de684d4a015ba7a4eaf AS builder
 
 WORKDIR /app
 
@@ -25,7 +25,7 @@ COPY tsconfig.json ./
 COPY src/ ./src/
 RUN npm run build
 
-FROM node:24-alpine@sha256:156b55f92e98ccd5ef49578a8cea0df4679826564bad1c9d4ef04462b9f0ded6 AS release
+FROM node:24-alpine@sha256:e67514e5d0f6c46656005e1b693b2ec9d52e80b641307de684d4a015ba7a4eaf AS release
 
 WORKDIR /app
 
@@ -47,5 +47,13 @@ USER node
 # Documentation only (does not publish the port). The default transport is stdio;
 # set MCP_TRANSPORT=http and publish this port to run the HTTP transport.
 EXPOSE 3000
+
+# No HEALTHCHECK by default. The default transport is stdio, where nothing
+# listens, so a probe of /health would mark every stdio container unhealthy.
+# For an HTTP deployment (MCP_TRANSPORT=http) uncomment the line below, or pass
+# the same command as `docker run --health-cmd` / a compose `healthcheck:` —
+# see the README's "Remote / HTTP transport" section.
+# HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+#   CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||3000)+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 
 ENTRYPOINT ["node", "build/index.js"]

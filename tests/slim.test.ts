@@ -223,6 +223,96 @@ describe("slimBlock", () => {
     });
     expect(slimBlock(image)).toMatchObject({ type: "image", image: "https://e.com/x.png" });
   });
+
+  // Every block subtype keeps its text under a different key; `text` should
+  // name the block whatever that key happens to be.
+  const blockText = (type: string, inner: unknown) =>
+    (
+      slimBlock(
+        fx<Parameters<typeof slimBlock>[0]>({ object: "block", id: `${type}1`, type, [type]: inner })
+      ) as { text?: string }
+    ).text;
+
+  it("surfaces the title of child_page and child_database blocks", () => {
+    expect(blockText("child_page", { title: "Roadmap" })).toBe("Roadmap");
+    expect(blockText("child_database", { title: "Tasks" })).toBe("Tasks");
+  });
+
+  it("surfaces an equation's LaTeX expression", () => {
+    expect(blockText("equation", { expression: "E = mc^2" })).toBe("E = mc^2");
+  });
+
+  it("falls back to the caption on media and link blocks", () => {
+    const file = { url: "https://e.com/x" };
+    expect(blockText("bookmark", { url: "https://e.com", caption: [{ plain_text: "the spec" }] })).toBe("the spec");
+    expect(blockText("embed", { url: "https://e.com", caption: [{ plain_text: "a demo" }] })).toBe("a demo");
+    expect(blockText("image", { type: "external", external: file, caption: [{ plain_text: "the diagram" }] })).toBe("the diagram");
+    expect(blockText("video", { type: "external", external: file, caption: [{ plain_text: "the walkthrough" }] })).toBe("the walkthrough");
+    expect(blockText("pdf", { type: "external", external: file, caption: [{ plain_text: "the contract" }] })).toBe("the contract");
+    expect(blockText("audio", { type: "external", external: file, caption: [{ plain_text: "the interview" }] })).toBe("the interview");
+  });
+
+  it("keeps an image's caption alongside its url", () => {
+    const image = fx<Parameters<typeof slimBlock>[0]>({
+      object: "block",
+      id: "i2",
+      type: "image",
+      image: {
+        type: "external",
+        external: { url: "https://e.com/x.png" },
+        caption: [{ plain_text: "the diagram" }],
+      },
+    });
+    // slimBlock gives image its own branch; the caption must survive the spread.
+    expect(slimBlock(image)).toMatchObject({
+      type: "image",
+      image: "https://e.com/x.png",
+      text: "the diagram",
+    });
+  });
+
+  it("names an uncaptioned file by its filename", () => {
+    const inner = { type: "file", file: { url: "https://e.com/q.pdf" }, name: "Q3-report.pdf" };
+    expect(blockText("file", { ...inner, caption: [] })).toBe("Q3-report.pdf");
+    // An authored caption still outranks the filename.
+    expect(blockText("file", { ...inner, caption: [{ plain_text: "the quarterly" }] })).toBe("the quarterly");
+  });
+
+  it("falls back to the url when a link block has no caption", () => {
+    expect(blockText("bookmark", { url: "https://spec.example", caption: [] })).toBe("https://spec.example");
+    expect(blockText("embed", { url: "https://e.com/demo" })).toBe("https://e.com/demo");
+    // link_preview has no caption key at all.
+    expect(blockText("link_preview", { url: "https://github.com/x/y/pull/1" })).toBe("https://github.com/x/y/pull/1");
+  });
+
+  it("describes a table_row by its cells", () => {
+    expect(blockText("table_row", { cells: [[{ plain_text: "Alice" }], [{ plain_text: "42" }]] })).toBe("Alice | 42");
+    expect(blockText("table_row", { cells: [[], []] })).toBeUndefined();
+  });
+
+  it("prefers a code block's source over its caption, but falls through when empty", () => {
+    const captioned = { caption: [{ plain_text: "prints one" }], language: "python" };
+    expect(blockText("code", { ...captioned, rich_text: [{ plain_text: "print(1)" }] })).toBe("print(1)");
+    // An empty source must not win with "" and swallow the caption.
+    expect(blockText("code", { ...captioned, rich_text: [] })).toBe("prints one");
+  });
+
+  it("tolerates malformed rich text instead of throwing", () => {
+    // slimBlock is mapped across a whole page, so one odd block must not
+    // abort the entire response.
+    expect(blockText("image", { type: "external", external: { url: "https://e.com/x.png" }, caption: [null] })).toBeUndefined();
+    expect(blockText("paragraph", { rich_text: [null, { plain_text: "kept" }] })).toBe("kept");
+  });
+
+  it("leaves text undefined for blocks that carry none", () => {
+    expect(blockText("divider", {})).toBeUndefined();
+    expect(blockText("child_page", { title: "" })).toBeUndefined();
+    expect(blockText("equation", { expression: "" })).toBeUndefined();
+    expect(blockText("paragraph", { rich_text: [] })).toBeUndefined();
+    // A subtype whose payload key is missing entirely must not throw.
+    const bare = fx<Parameters<typeof slimBlock>[0]>({ object: "block", id: "u1", type: "unsupported" });
+    expect((slimBlock(bare) as { text?: string }).text).toBeUndefined();
+  });
 });
 
 describe("slimDatabase", () => {
@@ -391,5 +481,85 @@ describe("slimList", () => {
     );
     expect(out.has_more).toBe(false);
     expect(out.next_cursor).toBe(null);
+  });
+});
+
+describe("slimBlock — table rows", () => {
+  it("returns a table_row's cells as plain strings", () => {
+    const row = fx<Parameters<typeof slimBlock>[0]>({
+      object: "block",
+      id: "r1",
+      type: "table_row",
+      has_children: false,
+      in_trash: false,
+      table_row: {
+        cells: [
+          [{ type: "text", plain_text: "Ap", text: { content: "Ap" } }, { type: "text", plain_text: "ple", text: { content: "ple" } }],
+          [],
+          [{ type: "text", plain_text: "3", text: { content: "3" } }],
+        ],
+      },
+    });
+    expect(slimBlock(row)).toMatchObject({ id: "r1", type: "table_row", cells: ["Apple", "", "3"] });
+  });
+
+  it("reports a table's width", () => {
+    const table = fx<Parameters<typeof slimBlock>[0]>({
+      object: "block",
+      id: "t1",
+      type: "table",
+      has_children: true,
+      in_trash: false,
+      table: { table_width: 3, has_column_header: true, has_row_header: false },
+    });
+    expect(slimBlock(table)).toMatchObject({ id: "t1", type: "table", table_width: 3, has_children: true });
+  });
+});
+
+describe("slimDataSource — option names", () => {
+  it("lists the options of select, multi_select and status properties and the target of a relation", () => {
+    const ds = fx<Parameters<typeof slimDataSource>[0]>({
+      object: "data_source",
+      id: "ds1",
+      url: "u",
+      title: [{ plain_text: "Tasks" }],
+      description: [],
+      parent: { type: "database_id", database_id: "db1" },
+      properties: {
+        Name: { type: "title", title: {} },
+        Status: {
+          type: "status",
+          status: { options: [{ name: "Not Started" }, { name: "In Progress" }, { name: "Done" }], groups: [] },
+        },
+        Tags: { type: "multi_select", multi_select: { options: [{ name: "a" }, { name: "b" }] } },
+        Kind: { type: "select", select: { options: [] } },
+        Project: { type: "relation", relation: { data_source_id: "ds-projects", type: "single_property" } },
+      },
+    });
+    expect(slimDataSource(ds)).toMatchObject({
+      properties: {
+        Name: "title",
+        Status: "status: Not Started | In Progress | Done",
+        Tags: "multi_select: a | b",
+        Kind: "select",
+        Project: "relation → ds-projects",
+      },
+    });
+  });
+
+  it("caps a long option list", () => {
+    const options = Array.from({ length: 40 }, (_, i) => ({ name: `o${i}` }));
+    const ds = fx<Parameters<typeof slimDataSource>[0]>({
+      object: "data_source",
+      id: "ds1",
+      url: "u",
+      title: [],
+      description: [],
+      parent: { type: "database_id", database_id: "db1" },
+      properties: { Many: { type: "select", select: { options } } },
+    });
+    const text = (slimDataSource(ds) as { properties: Record<string, string> }).properties.Many;
+    expect(text.startsWith("select: o0 | o1 |")).toBe(true);
+    expect(text.endsWith("| o29 | +10 more")).toBe(true);
   });
 });

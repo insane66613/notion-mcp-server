@@ -4,7 +4,7 @@ import { register } from "./registry.js";
 import { tryHandler } from "../utils/handler.js";
 import { slimPage, slimItem, slimList } from "../utils/slim.js";
 import { paginateAll } from "../utils/paginate.js";
-import type { OperationResult } from "./types.js";
+import type { OperationError, OperationResult } from "./types.js";
 import { parseMarkdownToBlocks } from "../markdown/parse.js";
 import { PARENT_SCHEMA } from "../schema/page.js";
 import { ICON_SCHEMA } from "../schema/icon.js";
@@ -17,51 +17,54 @@ import {
   type UpdatePageBody,
   type UpdatePageMarkdownBody,
 } from "../utils/notion-types.js";
+import { PROPERTY_VALUE_SCHEMA } from "../schema/page-properties.js";
+import { coerceProperties, hasShorthandValues } from "../schema/property-shorthand.js";
 import {
-  CHECKBOX_PROPERTY_VALUE_SCHEMA,
-  DATE_PROPERTY_VALUE_SCHEMA,
-  EMAIL_PROPERTY_VALUE_SCHEMA,
-  FILES_PROPERTY_VALUE_SCHEMA,
-  MULTI_SELECT_PROPERTY_VALUE_SCHEMA,
-  NUMBER_PROPERTY_VALUE_SCHEMA,
-  PEOPLE_PROPERTY_VALUE_SCHEMA,
-  PHONE_NUMBER_PROPERTY_VALUE_SCHEMA,
-  RELATION_PROPERTY_VALUE_SCHEMA,
-  RICH_TEXT_PROPERTY_VALUE_SCHEMA,
-  SELECT_PROPERTY_VALUE_SCHEMA,
-  STATUS_PROPERTY_VALUE_SCHEMA,
-  TITLE_PROPERTY_VALUE_SCHEMA,
-  URL_PROPERTY_VALUE_SCHEMA,
-  VERIFICATION_PROPERTY_VALUE_SCHEMA,
-} from "../schema/page-properties.js";
+  dataSourceIdForPage,
+  dataSourceIdForParent,
+  getDataSourceSchema,
+  type DataSourceSchema,
+} from "../services/schema-cache.js";
+import { BLOCK_INPUT_SCHEMA } from "../schema/blocks.js";
+import { normalizeNotionId, notionId } from "../schema/id.js";
 
 const VERBOSE = z.boolean().optional();
 
-const PROPERTY_VALUE_SCHEMA = z.union([
-  TITLE_PROPERTY_VALUE_SCHEMA,
-  RICH_TEXT_PROPERTY_VALUE_SCHEMA,
-  NUMBER_PROPERTY_VALUE_SCHEMA,
-  SELECT_PROPERTY_VALUE_SCHEMA,
-  MULTI_SELECT_PROPERTY_VALUE_SCHEMA,
-  STATUS_PROPERTY_VALUE_SCHEMA,
-  DATE_PROPERTY_VALUE_SCHEMA,
-  PEOPLE_PROPERTY_VALUE_SCHEMA,
-  FILES_PROPERTY_VALUE_SCHEMA,
-  CHECKBOX_PROPERTY_VALUE_SCHEMA,
-  URL_PROPERTY_VALUE_SCHEMA,
-  EMAIL_PROPERTY_VALUE_SCHEMA,
-  PHONE_NUMBER_PROPERTY_VALUE_SCHEMA,
-  RELATION_PROPERTY_VALUE_SCHEMA,
-  VERIFICATION_PROPERTY_VALUE_SCHEMA,
-]);
 
 function resolveParent(
   parent: z.infer<typeof PARENT_SCHEMA> | undefined
 ): z.infer<typeof PARENT_SCHEMA> | undefined {
   if (parent) return parent;
   const envId = process.env.NOTION_PAGE_ID;
-  if (envId) return { type: "page_id", page_id: envId };
+  if (envId) return { type: "page_id", page_id: normalizeNotionId(envId) };
   return undefined;
+}
+
+type Prepared =
+  | { ok: true; properties: Record<string, unknown>; warnings: string[] }
+  | { ok: false; error: OperationError };
+
+/**
+ * Turn plain property values into typed ones using the row's data source
+ * schema. The schema is fetched (and cached) only when a plain value is
+ * present, so typed payloads cost no extra request.
+ */
+async function prepareProperties(
+  properties: Record<string, unknown>,
+  lookup: () => Promise<DataSourceSchema | undefined>
+): Promise<Prepared> {
+  let schema: DataSourceSchema | undefined;
+  if (hasShorthandValues(properties)) {
+    schema = await lookup();
+    if (schema && Object.keys(schema).length === 0) schema = undefined;
+  }
+  const coerced = coerceProperties(properties, schema);
+  if (!coerced.ok) return coerced;
+  return { ok: true, properties: coerced.properties, warnings: coerced.warnings };
+}
+
+function withWarnings<T>(result: { ok: true; data: T }, warnings: string[]): OperationResult<T> {
+  return warnings.length ? { ...result, warnings } : result;
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -72,13 +75,18 @@ const CreatePageParams = z
   .object({
     parent: PARENT_SCHEMA.optional(),
     title: z.string().optional().describe("Shortcut for setting the title property."),
-    properties: z.record(z.string(), PROPERTY_VALUE_SCHEMA).optional(),
-    markdown: z.string().optional().describe("Page body as markdown. Parsed server-side."),
-    children: z.array(z.unknown()).optional().describe("Structured Notion blocks. Mutually exclusive with markdown."),
+    properties: z
+      .record(z.string(), PROPERTY_VALUE_SCHEMA)
+      .optional()
+      .describe(
+        "Row properties by name. Under a data_source_id parent plain values are enough: { Status: 'Done', Due: '2026-01-01', Tags: ['a', 'b'], Done: true }."
+      ),
+    markdown: z.string().optional().describe("Page body as markdown (GFM: headings, lists, - [ ] checkboxes, tables, code). Parsed server-side."),
+    children: z.array(BLOCK_INPUT_SCHEMA).optional().describe("Structured Notion blocks. Mutually exclusive with markdown."),
     template: z
       .object({
         type: z.enum(["default", "none", "template_id"]).describe("`template_id` to apply a specific template, `default` for the data source's default template, `none` for no template."),
-        template_id: z.string().optional().describe("Required when type is 'template_id'. Discover IDs via list_data_source_templates."),
+        template_id: notionId().optional().describe("Required when type is 'template_id'. Discover IDs via list_data_source_templates."),
         timezone: z.string().optional().describe("IANA tz (e.g. 'Asia/Hong_Kong') controlling @now/@today resolution inside the template."),
       })
       .optional()
@@ -101,7 +109,8 @@ register({
   name: "create_page",
   access: "write",
   domain: "pages",
-  description: "Create a new Notion page. Body can be markdown (recommended) or structured blocks.",
+  description:
+    "Create a page under a page or as a row of a data source. Body can be markdown (recommended) or structured blocks; row properties take plain values.",
   batchable: true,
   schema: CreatePageParams,
   example: {
@@ -111,8 +120,16 @@ register({
   },
   exampleBatch: {
     items: [
-      { title: "Page 1", markdown: "First page body." },
-      { title: "Page 2", markdown: "Second page body." },
+      {
+        parent: { type: "data_source_id", data_source_id: "<data-source-id>" },
+        title: "Write the report",
+        properties: { Status: "In Progress", Priority: "High", "Due Date": "2026-10-01" },
+      },
+      {
+        parent: { type: "data_source_id", data_source_id: "<data-source-id>" },
+        title: "Review the report",
+        properties: { Status: "Not Started", "Due Date": "2026-10-03" },
+      },
     ],
     concurrency: 3,
   },
@@ -135,12 +152,37 @@ register({
         },
       };
     }
-    const properties: Record<string, unknown> = { ...(params.properties ?? {}) };
-    if (params.title && !properties.title) {
-      properties.title = {
+    const raw: Record<string, unknown> = { ...(params.properties ?? {}) };
+    if (params.title && !raw.title) {
+      raw.title = {
         title: [{ type: "text", text: { content: params.title } }],
       };
     }
+    let rowParent: Record<string, unknown> = parent;
+    const prepared = await prepareProperties(raw, async () => {
+      if (parent.type === "page_id") return undefined;
+      const dsId = await dataSourceIdForParent(parent);
+      if (!dsId) {
+        throw Object.assign(new Error("multi_source_database"), { code: "multi_source_database" });
+      }
+      // A database with one data source: create the row in that source.
+      rowParent = { type: "data_source_id", data_source_id: dsId };
+      return getDataSourceSchema(dsId);
+    }).catch((error: unknown): Prepared => {
+      if ((error as { code?: string }).code === "multi_source_database") {
+        return {
+          ok: false,
+          error: {
+            code: "multi_source_database",
+            message: "The database has more than one data source, so a plain property value cannot be typed.",
+            fix: "Pass parent { type: 'data_source_id', data_source_id } — list_data_sources shows the ids — or typed property values.",
+          },
+        };
+      }
+      throw error;
+    });
+    if (!prepared.ok) return prepared;
+    const { properties, warnings } = prepared;
     // A template and explicit body content are mutually exclusive (API rule).
     const children = params.template
       ? undefined
@@ -150,7 +192,7 @@ register({
 
     const notion = await getClient();
     const body = {
-      parent,
+      parent: rowParent,
       properties,
       ...(children && children.length ? { children } : {}),
       ...(params.template ? { template: params.template } : {}),
@@ -158,7 +200,7 @@ register({
       ...(params.cover !== undefined ? { cover: params.cover } : {}),
     };
     const response = await notion.pages.create(asSdk<CreatePageBody>(body));
-    return { ok: true, data: slimPage(response, params.verbose ?? false) };
+    return withWarnings({ ok: true, data: slimPage(response, params.verbose ?? false) }, warnings);
   }),
 });
 
@@ -167,7 +209,7 @@ register({
 // ──────────────────────────────────────────────────────────────────────────
 
 const SetPageTitleParams = z.object({
-  page_id: z.string(),
+  page_id: notionId(),
   title: z.string(),
   verbose: VERBOSE,
 });
@@ -222,11 +264,9 @@ function wrapTitleShorthand(input: unknown): unknown {
 const SetPagePropertyParams = z.preprocess(
   wrapTitleShorthand,
   z.object({
-    page_id: z.string(),
-    name: z.string().describe("Property name (case-sensitive). Use `title` for the title property; you may pass value as a plain string in that case."),
-    value: PROPERTY_VALUE_SCHEMA.describe(
-      "Property value object matching the property type, e.g. {checkbox: true}, {select: {name: 'Open'}}. For `name: 'title'` a plain string is accepted as a shorthand."
-    ),
+    page_id: notionId(),
+    name: z.string().describe("Property name as shown in Notion. `title` always addresses the title property."),
+    value: PROPERTY_VALUE_SCHEMA,
     verbose: VERBOSE,
   })
 );
@@ -235,28 +275,37 @@ register({
   name: "set_page_property",
   access: "write",
   domain: "pages",
-  description: "Set one property on one page. For batch updates use items[].",
+  description:
+    "Set one property on one page. A plain value is typed from the data source schema (\"Done\", 42, true, \"2026-01-01\", [\"a\", \"b\"], null to clear). For several properties use set_page_properties.",
   batchable: true,
   schema: SetPagePropertyParams,
   example: {
     page_id: "<page-id>",
     name: "Status",
-    value: { status: { name: "In progress" } },
+    value: "In progress",
   },
   exampleBatch: {
     items: [
-      { page_id: "<page-id>", name: "Checked", value: { checkbox: true } },
-      { page_id: "<page-id>", name: "Score", value: { number: 42 } },
+      { page_id: "<page-id>", name: "Checked", value: true },
+      { page_id: "<page-id>", name: "Score", value: 42 },
     ],
   },
   handler: tryHandler(async ({ page_id, name, value, verbose }) => {
+    const prepared = await prepareProperties({ [name]: value }, () => rowSchemaForPage(page_id));
+    if (!prepared.ok) return prepared;
     const notion = await getClient();
     const response = await notion.pages.update(
-      asSdk<UpdatePageBody>({ page_id, properties: { [name]: value } })
+      asSdk<UpdatePageBody>({ page_id, properties: prepared.properties })
     );
-    return { ok: true, data: slimPage(response, verbose ?? false) };
+    return withWarnings({ ok: true, data: slimPage(response, verbose ?? false) }, prepared.warnings);
   }),
 });
+
+/** Schema of the data source a page belongs to; undefined for a non-row page. */
+async function rowSchemaForPage(pageId: string): Promise<DataSourceSchema | undefined> {
+  const dsId = await dataSourceIdForPage(pageId);
+  return dsId ? getDataSourceSchema(dsId) : undefined;
+}
 
 // ──────────────────────────────────────────────────────────────────────────
 // set_page_properties (plural)
@@ -281,11 +330,11 @@ function wrapTitleShorthandInProperties(input: unknown): unknown {
 const SetPagePropertiesParams = z.preprocess(
   wrapTitleShorthandInProperties,
   z.object({
-    page_id: z.string(),
+    page_id: notionId(),
     properties: z
       .record(z.string(), PROPERTY_VALUE_SCHEMA)
       .describe(
-        "Map of property name → value, written in one API call. Use this when updating multiple properties on the same page. For the `title` key, a plain string is accepted as a shorthand."
+        "Property name → value, written in one API call. Plain values are typed from the data source schema: { Status: 'Done', Score: 42, Done: true, 'Due Date': '2026-01-01', Tags: ['a', 'b'], Notes: null }."
       ),
     verbose: VERBOSE,
   })
@@ -295,35 +344,33 @@ register({
   name: "set_page_properties",
   access: "write",
   domain: "pages",
-  description: "Set multiple properties on one page in a single API call. Use set_page_property for one-off updates.",
+  description:
+    "Set several properties on one page in one API call, with plain values typed from the data source schema. Use set_page_property for a single property.",
   batchable: true,
   schema: SetPagePropertiesParams,
   example: {
     page_id: "<page-id>",
     properties: {
-      Status: { status: { name: "In progress" } },
-      Score: { number: 42 },
-      Done: { checkbox: false },
+      Status: "In progress",
+      Score: 42,
+      Done: false,
+      "Due Date": "2026-10-01",
     },
   },
   exampleBatch: {
     items: [
-      {
-        page_id: "<page-id-1>",
-        properties: { Status: { status: { name: "Done" } } },
-      },
-      {
-        page_id: "<page-id-2>",
-        properties: { Status: { status: { name: "Done" } } },
-      },
+      { page_id: "<page-id-1>", properties: { Status: "Done" } },
+      { page_id: "<page-id-2>", properties: { Status: "Done" } },
     ],
   },
   handler: tryHandler(async ({ page_id, properties, verbose }) => {
+    const prepared = await prepareProperties(properties, () => rowSchemaForPage(page_id));
+    if (!prepared.ok) return prepared;
     const notion = await getClient();
     const response = await notion.pages.update(
-      asSdk<UpdatePageBody>({ page_id, properties })
+      asSdk<UpdatePageBody>({ page_id, properties: prepared.properties })
     );
-    return { ok: true, data: slimPage(response, verbose ?? false) };
+    return withWarnings({ ok: true, data: slimPage(response, verbose ?? false) }, prepared.warnings);
   }),
 });
 
@@ -331,7 +378,7 @@ register({
 // archive_page / restore_page
 // ──────────────────────────────────────────────────────────────────────────
 
-const PageIdParams = z.object({ page_id: z.string(), verbose: VERBOSE });
+const PageIdParams = z.object({ page_id: notionId(), verbose: VERBOSE });
 
 const archivePageHandler = tryHandler(async ({ page_id, verbose }: z.infer<typeof PageIdParams>) => {
   const notion = await getClient();
@@ -410,12 +457,19 @@ register({
   name: "search_pages",
   access: "read",
   domain: "pages",
-  description: "Search pages and databases by title. Title-only; does NOT search page body content. Pass paginate:true to auto-walk all pages.",
+  description:
+    "Search pages and databases by title. Title-only; does NOT search page body content. Each result carries `object` (page | database | data_source). Pass paginate:true to auto-walk all pages.",
   batchable: false,
   schema: SearchPagesParams,
   example: { query: "smoke test", page_size: 10 },
   handler: tryHandler(async ({ query, sort_direction, page_size, start_cursor, paginate, page_limit, verbose }): Promise<OperationResult> => {
     const notion = await getClient();
+    // Slim pages and databases look alike; the object kind says which id
+    // goes where (a database id is not a valid create_page parent).
+    const slimKind = (item: Parameters<typeof slimItem>[0], v?: boolean) => ({
+      object: item.object,
+      ...slimItem(item, v),
+    });
     const sort = sort_direction
       ? { sort: { direction: sort_direction, timestamp: "last_edited_time" as const } }
       : {};
@@ -436,7 +490,7 @@ register({
       return {
         ok: true,
         data: {
-          results: results.map((item) => slimItem(item, verbose ?? false)),
+          results: results.map((item) => slimKind(item, verbose ?? false)),
           truncated,
           pages_walked,
         },
@@ -449,7 +503,7 @@ register({
       page_size: page_size ?? 10,
       start_cursor,
     });
-    return { ok: true, data: slimList(response, slimItem, verbose ?? false) };
+    return { ok: true, data: slimList(response, slimKind, verbose ?? false) };
   }),
 });
 
@@ -458,7 +512,7 @@ register({
 // ──────────────────────────────────────────────────────────────────────────
 
 const GetPageParams = z.object({
-  page_id: z.string(),
+  page_id: notionId(),
   include_properties: z
     .boolean()
     .optional()
@@ -492,7 +546,7 @@ register({
 // ──────────────────────────────────────────────────────────────────────────
 
 const MovePageParams = z.object({
-  page_id: z.string(),
+  page_id: notionId(),
   parent: PARENT_SCHEMA.describe("New parent (page_id or data_source_id). Same shape as create_page's `parent`."),
   verbose: VERBOSE,
 });
@@ -541,7 +595,7 @@ register({
 // ──────────────────────────────────────────────────────────────────────────
 
 const GetPageMarkdownParams = z.object({
-  page_id: z.string(),
+  page_id: notionId(),
 });
 
 register({
@@ -564,12 +618,12 @@ register({
 // ──────────────────────────────────────────────────────────────────────────
 
 const UpdatePageMarkdownParams = z.object({
-  page_id: z.string(),
+  page_id: notionId(),
   markdown: z.string().describe("Markdown content. Replaces the existing body by default; with insert_content it is inserted instead."),
   insert_content: z
     .object({
       position: z.enum(["start", "end"]).describe("Insert at start or end of the page."),
-      after: z.string().optional().describe("Block id to insert after (mutually exclusive with position in practice — Notion uses whichever is provided)."),
+      after: notionId("block").optional().describe("Block id to insert after (mutually exclusive with position in practice — Notion uses whichever is provided)."),
     })
     .optional(),
   allow_deleting_content: z

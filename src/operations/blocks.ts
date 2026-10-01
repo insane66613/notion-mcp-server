@@ -4,7 +4,6 @@ import { register } from "./registry.js";
 import { tryHandler } from "../utils/handler.js";
 import { slimBlock, slimList } from "../utils/slim.js";
 import { parseMarkdownToBlocks } from "../markdown/parse.js";
-import { TEXT_BLOCK_REQUEST_SCHEMA } from "../schema/blocks.js";
 import type { OperationResult } from "./types.js";
 import {
   asSdk,
@@ -12,6 +11,8 @@ import {
   type AppendBlockChildren,
   type UpdateBlockBody,
 } from "../utils/notion-types.js";
+import { BLOCK_INPUT_SCHEMA } from "../schema/blocks.js";
+import { notionId } from "../schema/id.js";
 
 const VERBOSE = z.boolean().optional();
 
@@ -21,10 +22,10 @@ const VERBOSE = z.boolean().optional();
 
 const AppendBlocksParams = z
   .object({
-    block_id: z.string().describe("Parent page ID or block ID to append into."),
+    block_id: notionId("block").describe("Parent page ID or block ID to append into."),
     markdown: z.string().optional().describe("Content to append, as markdown. Parsed server-side."),
-    children: z.array(z.unknown()).optional().describe("Structured Notion blocks. Mutually exclusive with markdown."),
-    after: z.string().optional().describe("Append immediately after this block ID (legacy ordering)."),
+    children: z.array(BLOCK_INPUT_SCHEMA).optional().describe("Structured Notion blocks. Mutually exclusive with markdown."),
+    after: notionId("block").optional().describe("Append immediately after this block ID (legacy ordering)."),
     position: z.enum(["start", "end"]).optional().describe("Append at start or end. Preferred over `after`."),
     verbose: VERBOSE,
   })
@@ -108,7 +109,7 @@ register({
 // ──────────────────────────────────────────────────────────────────────────
 
 const GetBlockParams = z.object({
-  block_id: z.string().describe("Block ID to retrieve."),
+  block_id: notionId("block").describe("Block ID to retrieve."),
   verbose: VERBOSE,
 });
 
@@ -135,7 +136,7 @@ register({
 // ──────────────────────────────────────────────────────────────────────────
 
 const GetBlockChildrenParams = z.object({
-  block_id: z.string().describe("Page ID or block ID. For a page, returns its top-level blocks."),
+  block_id: notionId("block").describe("Page ID or block ID. For a page, returns its top-level blocks."),
   start_cursor: z.string().optional(),
   page_size: z.number().min(1).max(100).optional(),
   verbose: VERBOSE,
@@ -170,52 +171,46 @@ function extractTypedBody(block: BlockTypedBody): Record<string, unknown> {
   return { [block.type]: block[block.type] };
 }
 
-// Block-type keys recognized in update_block's structured `data`.
-// When `data` has exactly one of these keys and no explicit `type`,
-// we infer the discriminator so the caller can write {to_do:{...}}
-// instead of {type:"to_do", to_do:{...}}.
-const INFERRABLE_BLOCK_TYPES = new Set([
-  "paragraph",
-  "heading_1",
-  "heading_2",
-  "heading_3",
-  "heading_4",
-  "quote",
-  "callout",
-  "toggle",
-  "bulleted_list_item",
-  "numbered_list_item",
-  "to_do",
-  "code",
-  "divider",
-  "image",
-  "tab",
-]);
-
+// When `data` has no explicit `type` and exactly one object-valued key, that
+// key is the block type, so {to_do:{checked:true}} works as well as
+// {type:"to_do", to_do:{checked:true}}.
 function inferDataType(input: unknown): unknown {
   if (typeof input !== "object" || input === null || Array.isArray(input)) return input;
   const obj = input as Record<string, unknown>;
   if (typeof obj.type === "string") return obj;
-  const matched = Object.keys(obj).filter((k) => INFERRABLE_BLOCK_TYPES.has(k));
-  if (matched.length === 1) {
-    return { type: matched[0], ...obj };
+  const bodies = Object.keys(obj).filter((k) => typeof obj[k] === "object" && obj[k] !== null && !Array.isArray(obj[k]));
+  if (bodies.length === 1) {
+    return { type: bodies[0], ...obj };
   }
   return obj;
 }
 
+// Notion's update endpoint is a partial update: only the fields inside the
+// body key change, so {to_do:{checked:true}} leaves the text alone. The
+// shape is checked structurally ({type, <type>: {...}}) and Notion validates
+// the fields; a typed schema here forced callers to resend rich_text just to
+// tick a box.
+const UPDATE_DATA_SCHEMA = z.preprocess(
+  inferDataType,
+  z
+    .looseObject({ type: z.string().describe("Block type; inferred from the sole body key when omitted.") })
+    .refine((v) => Object.hasOwn(v, v.type) && typeof v[v.type] === "object" && v[v.type] !== null, {
+      message: "A block update is { type, <type>: { ...fields to change } }, e.g. { to_do: { checked: true } }.",
+    })
+);
+
 const UpdateBlockParams = z
   .object({
-    block_id: z.string(),
+    block_id: notionId("block"),
     markdown: z
       .string()
       .optional()
-      .describe("New content as markdown. Must parse to exactly one block matching the existing block's type."),
-    data: z
-      .preprocess(inferDataType, TEXT_BLOCK_REQUEST_SCHEMA)
-      .optional()
       .describe(
-        "Structured block envelope: `{type, <type>: {...}}` (e.g. `{type:\"to_do\", to_do:{rich_text:[...], checked:true}}`). When `type` is omitted, it is inferred from the sole block-type key, so `{to_do:{...}}` works as well. Type must match the existing block."
+        "New content as markdown. Must parse to exactly one block of the existing block's type; `- [x] text` sets a to_do's text and checked state together."
       ),
+    data: UPDATE_DATA_SCHEMA.optional().describe(
+      "Partial update of the block's own fields: `{ <type>: { ...fields } }`, e.g. `{ to_do: { checked: true } }`, `{ code: { language: \"python\" } }`, `{ paragraph: { rich_text: [...] } }`. Fields you leave out are unchanged. The type must match the existing block."
+    ),
     verbose: VERBOSE,
   })
   .refine((v) => Boolean(v.markdown) !== Boolean(v.data), {
@@ -227,17 +222,14 @@ register({
   access: "write",
   domain: "blocks",
   description:
-    "Update an existing block's content. Pass `markdown` for prose blocks (parsed locally to a single block), or `data` for structured updates such as toggling a to_do's `checked` field or setting a code block's language.",
+    "Update one block. Pass `markdown` for its content (one block; `- [x] text` for a done to_do), or `data` for a partial field update such as { to_do: { checked: true } } or { code: { language: \"python\" } }.",
   batchable: true,
   schema: UpdateBlockParams,
   example: { block_id: "<block-id>", markdown: "Updated paragraph text." },
   exampleBatch: {
     items: [
       { block_id: "<block-id-1>", markdown: "First update." },
-      {
-        block_id: "<block-id-2>",
-        data: { to_do: { rich_text: [{ type: "text", text: { content: "Done" } }], checked: true } },
-      },
+      { block_id: "<block-id-2>", data: { to_do: { checked: true } } },
     ],
   },
   handler: tryHandler(async ({ block_id, markdown, data, verbose }) => {
@@ -270,7 +262,7 @@ register({
 // delete_block
 // ──────────────────────────────────────────────────────────────────────────
 
-const DeleteBlockParams = z.object({ block_id: z.string(), verbose: VERBOSE });
+const DeleteBlockParams = z.object({ block_id: notionId("block"), verbose: VERBOSE });
 
 register({
   name: "delete_block",
@@ -296,19 +288,19 @@ register({
 const MixedOp = z.discriminatedUnion("op", [
   z.object({
     op: z.literal("append"),
-    block_id: z.string(),
+    block_id: notionId("block"),
     markdown: z.string().optional(),
-    children: z.array(z.unknown()).optional(),
+    children: z.array(BLOCK_INPUT_SCHEMA).optional(),
   }),
   z.object({
     op: z.literal("update"),
-    block_id: z.string(),
+    block_id: notionId("block"),
     markdown: z.string().optional(),
-    data: z.preprocess(inferDataType, TEXT_BLOCK_REQUEST_SCHEMA).optional(),
+    data: UPDATE_DATA_SCHEMA.optional(),
   }),
   z.object({
     op: z.literal("delete"),
-    block_id: z.string(),
+    block_id: notionId("block"),
   }),
 ]);
 

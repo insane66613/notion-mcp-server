@@ -14,8 +14,8 @@ vi.mock("../src/services/notion.js", () => ({ getClient: async () => notionStub 
 import { initOperations } from "../src/operations/index.js";
 import { startHttp, type HttpHandle } from "../src/server/http.js";
 import { parseHttpConfig } from "../src/config/http.js";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { Client } from "@modelcontextprotocol/client";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 
 const ACCEPT = "application/json, text/event-stream";
 const INIT_BODY = JSON.stringify({
@@ -57,14 +57,16 @@ afterAll(async () => {
 });
 
 describe("Streamable HTTP transport (no auth)", () => {
-  it("completes the MCP handshake and lists notion_execute + notion_describe", async () => {
+  it("completes the MCP handshake and lists notion_read, notion_write and notion_describe", async () => {
     const client = new Client({ name: "http-it", version: "0.0.0" });
     await client.connect(
       new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${noAuth.port}/mcp`))
     );
     const { tools } = await client.listTools();
     const names = tools.map((t) => t.name);
-    expect(names).toContain("notion_execute");
+    expect(names).toContain("notion_read");
+    expect(names).toContain("notion_write");
+    expect(names).not.toContain("notion_execute");
     expect(names).toContain("notion_describe");
     await client.close();
   });
@@ -94,6 +96,7 @@ describe("Streamable HTTP transport (auth required)", () => {
       body: INIT_BODY,
     });
     expect(res.status).toBe(401);
+    expect((await res.json()).error.code).toBe(-32001);
   });
 
   it("403s a /mcp request with a wrong bearer token", async () => {
@@ -107,6 +110,7 @@ describe("Streamable HTTP transport (auth required)", () => {
       body: INIT_BODY,
     });
     expect(res.status).toBe(403);
+    expect((await res.json()).error.code).toBe(-32003);
   });
 
   it("still serves /health without auth", async () => {

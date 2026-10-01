@@ -1,4 +1,8 @@
-import { describe, it, expect, beforeAll, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from "vitest";
+import { HttpsProxyAgent } from "https-proxy-agent";
+import { mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type {
   BatchResult,
   OperationError,
@@ -57,11 +61,23 @@ const notionStub = {
     retrieve: vi.fn<(args: FileUploadIdArg) => Promise<FileUploadShape>>(),
     list: vi.fn<(args: ListArgs) => Promise<ListShape>>(),
   },
+  blocks: {
+    children: {
+      append: vi.fn<(args: any) => Promise<{ results: { id: string }[] }>>(),
+    },
+  },
 };
 
-vi.mock("../src/services/notion.js", () => ({
+// Only getClient is replaced: proxyAwareFetch stays real (it is what the URL
+// source goes through) and node-fetch underneath it is the stub.
+vi.mock("../src/services/notion.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../src/services/notion.js")>()),
   getClient: async () => notionStub,
 }));
+
+// vi.mock is hoisted above the imports, so the stub it hands out must be too.
+const { fetchStub } = vi.hoisted(() => ({ fetchStub: vi.fn() }));
+vi.mock("node-fetch", () => ({ default: fetchStub }));
 
 import { initOperations } from "../src/operations/index.js";
 import { dispatch } from "../src/dispatch/index.js";
@@ -72,6 +88,8 @@ beforeAll(async () => {
 
 beforeEach(() => {
   for (const fn of Object.values(notionStub.fileUploads)) fn.mockReset();
+  notionStub.blocks.children.append.mockReset();
+  fetchStub.mockReset();
 });
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -193,6 +211,30 @@ describe("upload_file (single-part)", () => {
     expect(blob.type).toBe("text/plain");
   });
 
+  it.each([
+    ["notes.md", "text/markdown"],
+    ["deck.pptx", "application/vnd.openxmlformats-officedocument.presentationml.presentation"],
+    ["sheet.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"],
+    ["doc.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"],
+  ])("infers content_type for %s", async (filename, expectedType) => {
+    notionStub.fileUploads.create.mockResolvedValue({ id: "fu-infer" });
+    notionStub.fileUploads.send.mockResolvedValue({
+      id: "fu-infer",
+      status: "uploaded",
+    });
+
+    await dispatch("upload_file", {
+      filename,
+      source: { type: "base64", data: Buffer.from("x").toString("base64") },
+    });
+
+    expect(notionStub.fileUploads.create).toHaveBeenCalledWith({
+      mode: "single_part",
+      filename,
+      content_type: expectedType,
+    });
+  });
+
   it("returns validation_error envelope when content_type is omitted and the extension isn't on the allowlist", async () => {
     const res = await dispatch("upload_file", {
       mode: "single",
@@ -309,7 +351,7 @@ describe("upload_file (multi-part)", () => {
 describe("upload_file (URL source)", () => {
   it("fetches the URL and forwards the exact bytes to fileUploads.send", async () => {
     const remoteBytes = Buffer.from([0xde, 0xad, 0xbe, 0xef, 0x42, 0x00, 0x99]);
-    const fetchStub = vi.fn().mockResolvedValue({
+    fetchStub.mockResolvedValue({
       ok: true,
       status: 200,
       arrayBuffer: async () =>
@@ -318,7 +360,6 @@ describe("upload_file (URL source)", () => {
           remoteBytes.byteOffset + remoteBytes.byteLength
         ),
     });
-    vi.stubGlobal("fetch", fetchStub);
 
     notionStub.fileUploads.create.mockResolvedValue({ id: "fu-url" });
     notionStub.fileUploads.send.mockResolvedValue({
@@ -326,7 +367,33 @@ describe("upload_file (URL source)", () => {
       status: "uploaded",
     });
 
+    const res = await dispatch("upload_file", {
+      mode: "single",
+      filename: "blob.pdf",
+      source: { type: "url", url: "https://example.com/blob.pdf" },
+    });
+
+    expect(res).toMatchObject({ ok: true });
+    expect(fetchStub).toHaveBeenCalledTimes(1);
+    expect(fetchStub.mock.calls[0][0]).toBe("https://example.com/blob.pdf");
+    expect((await sendBytes(0)).equals(remoteBytes)).toBe(true);
+  });
+
+  it("goes through the proxy in HTTPS_PROXY, like every Notion API call", async () => {
+    const saved = process.env.HTTPS_PROXY;
+    process.env.HTTPS_PROXY = "http://proxy.local:3128";
     try {
+      fetchStub.mockResolvedValue({
+        ok: true,
+        status: 200,
+        arrayBuffer: async () => new ArrayBuffer(4),
+      });
+      notionStub.fileUploads.create.mockResolvedValue({ id: "fu-proxy" });
+      notionStub.fileUploads.send.mockResolvedValue({
+        id: "fu-proxy",
+        status: "uploaded",
+      });
+
       const res = await dispatch("upload_file", {
         mode: "single",
         filename: "blob.pdf",
@@ -334,11 +401,92 @@ describe("upload_file (URL source)", () => {
       });
 
       expect(res).toMatchObject({ ok: true });
-      expect(fetchStub).toHaveBeenCalledWith("https://example.com/blob.pdf");
-      expect((await sendBytes(0)).equals(remoteBytes)).toBe(true);
+      const init = fetchStub.mock.calls[0][1] as { agent?: HttpsProxyAgent<string> };
+      expect(init.agent).toBeInstanceOf(HttpsProxyAgent);
+      expect(init.agent?.proxy.href).toBe("http://proxy.local:3128/");
     } finally {
-      vi.unstubAllGlobals();
+      if (saved === undefined) delete process.env.HTTPS_PROXY;
+      else process.env.HTTPS_PROXY = saved;
     }
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────────────
+// upload_file: local path source
+// ──────────────────────────────────────────────────────────────────────────
+
+describe("upload_file (path source)", () => {
+  it("reads the file from disk and derives filename from the path basename", async () => {
+    const { mkdtemp, writeFile, rm } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+
+    const dir = await mkdtemp(join(tmpdir(), "notion-upload-"));
+    const filePath = join(dir, "report.txt");
+    const payload = Buffer.from("local bytes on disk");
+    await writeFile(filePath, payload);
+
+    notionStub.fileUploads.create.mockResolvedValue({ id: "fu-path" });
+    notionStub.fileUploads.send.mockResolvedValue({
+      id: "fu-path",
+      status: "uploaded",
+    });
+
+    try {
+      const res = await dispatch("upload_file", {
+        source: { type: "path", path: filePath },
+      });
+
+      expect(res).toMatchObject({ ok: true });
+      // filename derived from basename, content_type inferred from .txt
+      expect(notionStub.fileUploads.create).toHaveBeenCalledWith({
+        mode: "single_part",
+        filename: "report.txt",
+        content_type: "text/plain",
+      });
+      expect((await sendBytes(0)).equals(payload)).toBe(true);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("honors an explicit filename over the path basename", async () => {
+    const { mkdtemp, writeFile, rm } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+
+    const dir = await mkdtemp(join(tmpdir(), "notion-upload-"));
+    const filePath = join(dir, "tmpname.bin");
+    await writeFile(filePath, Buffer.from("x"));
+
+    notionStub.fileUploads.create.mockResolvedValue({ id: "fu-path2" });
+    notionStub.fileUploads.send.mockResolvedValue({
+      id: "fu-path2",
+      status: "uploaded",
+    });
+
+    try {
+      await dispatch("upload_file", {
+        filename: "real.txt",
+        source: { type: "path", path: filePath },
+      });
+      expect(notionStub.fileUploads.create).toHaveBeenCalledWith({
+        mode: "single_part",
+        filename: "real.txt",
+        content_type: "text/plain",
+      });
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("surfaces the fs error when the path does not exist and makes no SDK calls", async () => {
+    const res = await dispatch("upload_file", {
+      source: { type: "path", path: "/no/such/file-xyz.txt" },
+    });
+    expect((res as { ok: boolean }).ok).toBe(false);
+    expect(notionStub.fileUploads.create).not.toHaveBeenCalled();
+    expect(notionStub.fileUploads.send).not.toHaveBeenCalled();
   });
 });
 
@@ -367,6 +515,17 @@ describe("upload_file (validation)", () => {
     expect(notionStub.fileUploads.create).not.toHaveBeenCalled();
     expect(notionStub.fileUploads.send).not.toHaveBeenCalled();
     expect(notionStub.fileUploads.complete).not.toHaveBeenCalled();
+  });
+
+  it("rejects a base64 source with no filename (nothing to derive) and makes no SDK calls", async () => {
+    const res = await dispatch("upload_file", {
+      source: { type: "base64", data: Buffer.from("x").toString("base64") },
+    });
+    assertErr(res);
+    expect(res.error.code).toBe("validation_error");
+    expect(res.error.message).toContain("filename is required");
+    expect(notionStub.fileUploads.create).not.toHaveBeenCalled();
+    expect(notionStub.fileUploads.send).not.toHaveBeenCalled();
   });
 });
 
@@ -428,5 +587,276 @@ describe("get_file_upload", () => {
         content_length: 1234,
       },
     });
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────────────
+// upload_file: NOTION_UPLOAD_ROOT
+// ──────────────────────────────────────────────────────────────────────────
+
+describe("upload_file (upload root)", () => {
+  const root = mkdtempSync(join(tmpdir(), "notion-root-"));
+  writeFileSync(join(root, "inside.txt"), "in");
+  const outside = mkdtempSync(join(tmpdir(), "notion-out-"));
+  writeFileSync(join(outside, "outside.txt"), "out");
+
+  beforeEach(() => {
+    notionStub.fileUploads.create.mockResolvedValue({ id: "fu-root", status: "pending" });
+    notionStub.fileUploads.send.mockResolvedValue({
+      id: "fu-root",
+      status: "uploaded",
+      filename: "inside.txt",
+    });
+  });
+
+  afterEach(() => {
+    delete process.env.NOTION_UPLOAD_ROOT;
+  });
+
+  it("takes a relative path inside the root", async () => {
+    process.env.NOTION_UPLOAD_ROOT = root;
+    const res = await dispatch("upload_file", { source: { type: "path", path: "inside.txt" } });
+    assertOk(res);
+  });
+
+  it("refuses a path outside the root", async () => {
+    process.env.NOTION_UPLOAD_ROOT = root;
+    const res = await dispatch("upload_file", {
+      source: { type: "path", path: join(outside, "outside.txt") },
+    });
+    assertErr(res);
+    expect(res.error.message).toContain("outside NOTION_UPLOAD_ROOT");
+  });
+
+  it("refuses a traversal out of the root", async () => {
+    process.env.NOTION_UPLOAD_ROOT = root;
+    const res = await dispatch("upload_file", {
+      source: { type: "path", path: "../../etc/passwd" },
+    });
+    assertErr(res);
+    expect(res.error.message).toContain("outside NOTION_UPLOAD_ROOT");
+  });
+
+  it("leaves absolute paths alone when no root is set", async () => {
+    const res = await dispatch("upload_file", {
+      source: { type: "path", path: join(outside, "outside.txt") },
+    });
+    assertOk(res);
+  });
+
+  // A prefix check on the lexical path is not confinement: resolve() never
+  // touches the filesystem, so a symlink sitting inside the root passes the
+  // check and then open() follows it straight out of the root.
+  it("refuses a symlink inside the root that points outside it", async () => {
+    process.env.NOTION_UPLOAD_ROOT = root;
+    symlinkSync(join(outside, "outside.txt"), join(root, "escape.txt"));
+    const res = await dispatch("upload_file", {
+      source: { type: "path", path: "escape.txt" },
+    });
+    assertErr(res);
+    expect(res.error.message).toContain("outside NOTION_UPLOAD_ROOT");
+    expect(notionStub.fileUploads.create).not.toHaveBeenCalled();
+  });
+
+  it("refuses a symlinked directory inside the root that points outside it", async () => {
+    process.env.NOTION_UPLOAD_ROOT = root;
+    symlinkSync(outside, join(root, "escape-dir"));
+    const res = await dispatch("upload_file", {
+      source: { type: "path", path: "escape-dir/outside.txt" },
+    });
+    assertErr(res);
+    expect(res.error.message).toContain("outside NOTION_UPLOAD_ROOT");
+    expect(notionStub.fileUploads.create).not.toHaveBeenCalled();
+  });
+
+  it("still follows a symlink that stays inside the root", async () => {
+    process.env.NOTION_UPLOAD_ROOT = root;
+    symlinkSync(join(root, "inside.txt"), join(root, "link-inside.txt"));
+    const res = await dispatch("upload_file", {
+      source: { type: "path", path: "link-inside.txt" },
+    });
+    assertOk(res);
+  });
+
+  // A path that does not exist cannot be a symlink, so the confinement check
+  // must fall through to a plain ENOENT rather than a resolution error.
+  it("reports a missing in-root file as a normal fs error", async () => {
+    process.env.NOTION_UPLOAD_ROOT = root;
+    const res = await dispatch("upload_file", {
+      source: { type: "path", path: "nope.txt" },
+    });
+    assertErr(res);
+    expect(res.error.message).not.toContain("outside NOTION_UPLOAD_ROOT");
+    expect(notionStub.fileUploads.create).not.toHaveBeenCalled();
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────────────
+// upload_file: attach_to
+// ──────────────────────────────────────────────────────────────────────────
+
+describe("upload_file (attach_to)", () => {
+  const PAGE_BARE = "3ab5030fc6e5801eb170cd93167dd607";
+  const PAGE = "3ab5030f-c6e5-801e-b170-cd93167dd607";
+  const BLOCK_BARE = "1f2e3d4c5b6a79880011223344556677";
+  const BLOCK = "1f2e3d4c-5b6a-7988-0011-223344556677";
+  const source = { type: "base64", data: Buffer.from("x").toString("base64") };
+
+  beforeEach(() => {
+    notionStub.fileUploads.create.mockResolvedValue({ id: "fu-att", status: "pending" });
+    notionStub.fileUploads.send.mockResolvedValue({
+      id: "fu-att",
+      status: "uploaded",
+      filename: "a.png",
+      content_type: "image/png",
+    });
+    notionStub.fileUploads.complete.mockResolvedValue({ id: "fu-att", status: "uploaded" });
+    notionStub.blocks.children.append.mockResolvedValue({ results: [{ id: "blk-1" }] });
+  });
+
+  it("appends nothing when attach_to is absent", async () => {
+    const res = await dispatch("upload_file", { filename: "a.png", source });
+    assertOk(res);
+    expect(res.data).toMatchObject({ file_upload_id: "fu-att" });
+    expect(res.data).not.toHaveProperty("block_id");
+    expect(notionStub.blocks.children.append).not.toHaveBeenCalled();
+  });
+
+  it("appends an image block with a caption and returns both ids", async () => {
+    const res = await dispatch("upload_file", {
+      filename: "a.png",
+      source,
+      attach_to: { block_id: PAGE_BARE, caption: "from disk" },
+    });
+    assertOk(res);
+    expect(res.data).toMatchObject({
+      file_upload_id: "fu-att",
+      block_id: "blk-1",
+      block_type: "image",
+    });
+
+    expect(notionStub.blocks.children.append).toHaveBeenCalledTimes(1);
+    const body = notionStub.blocks.children.append.mock.calls[0][0];
+    expect(body.block_id).toBe(PAGE);
+    expect(body.position).toBeUndefined();
+    expect(body.children).toEqual([
+      {
+        object: "block",
+        type: "image",
+        image: {
+          type: "file_upload",
+          file_upload: { id: "fu-att" },
+          caption: [{ type: "text", text: { content: "from disk" } }],
+        },
+      },
+    ]);
+  });
+
+  it("omits the caption when none is given", async () => {
+    await dispatch("upload_file", { filename: "a.png", source, attach_to: { block_id: PAGE } });
+    const block = notionStub.blocks.children.append.mock.calls[0][0].children[0];
+    expect(block.image).not.toHaveProperty("caption");
+  });
+
+  it.each([
+    ["chart.svg", "image/svg+xml", "image"],
+    ["photo.webp", "image/webp", "image"],
+    ["icon.ico", "image/vnd.microsoft.icon", "image"],
+    ["clip.mp4", "video/mp4", "video"],
+    ["clip.mov", "video/quicktime", "video"],
+    ["clip.webm", "video/webm", "video"],
+    ["song.mp3", "audio/mpeg", "audio"],
+    ["song.m4a", "audio/mp4", "audio"],
+    ["report.pdf", "application/pdf", "pdf"],
+    ["notes.txt", "text/plain", "file"],
+    ["data.csv", "text/csv", "file"],
+    [
+      "deck.pptx",
+      "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+      "file",
+    ],
+  ])("%s (%s) becomes a %s block", async (filename, content_type, kind) => {
+    const res = await dispatch("upload_file", {
+      filename,
+      content_type,
+      source,
+      attach_to: { block_id: PAGE },
+    });
+    assertOk(res);
+    expect(res.data).toMatchObject({ block_type: kind });
+    const block = notionStub.blocks.children.append.mock.calls[0][0].children[0];
+    expect(block.type).toBe(kind);
+    expect(block[kind]).toMatchObject({ type: "file_upload", file_upload: { id: "fu-att" } });
+  });
+
+  it("infers the block type from the filename when content_type is omitted", async () => {
+    await dispatch("upload_file", { filename: "clip.mp4", source, attach_to: { block_id: PAGE } });
+    expect(notionStub.blocks.children.append.mock.calls[0][0].children[0].type).toBe("video");
+  });
+
+  it("takes a Notion link for block_id and a block link for after", async () => {
+    const res = await dispatch("upload_file", {
+      filename: "a.png",
+      source,
+      attach_to: {
+        block_id: `https://www.notion.so/Page-${PAGE_BARE}?pvs=4`,
+        after: `https://www.notion.so/Page-${PAGE_BARE}#${BLOCK_BARE}`,
+      },
+    });
+    assertOk(res);
+    const body = notionStub.blocks.children.append.mock.calls[0][0];
+    expect(body.block_id).toBe(PAGE);
+    expect(body.position).toEqual({ type: "after_block", after_block: { id: BLOCK } });
+  });
+
+  it("passes position through like append_blocks", async () => {
+    await dispatch("upload_file", {
+      filename: "a.png",
+      source,
+      attach_to: { block_id: PAGE, position: "start" },
+    });
+    expect(notionStub.blocks.children.append.mock.calls[0][0].position).toEqual({ type: "start" });
+  });
+
+  it("rejects after together with position before uploading anything", async () => {
+    const res = await dispatch("upload_file", {
+      filename: "a.png",
+      source,
+      attach_to: { block_id: PAGE, position: "end", after: BLOCK },
+    });
+    assertErr(res);
+    expect(res.error.code).toBe("validation_error");
+    expect(JSON.stringify(res.error)).toContain("at most one of `after` or `position`");
+    expect(notionStub.fileUploads.create).not.toHaveBeenCalled();
+  });
+
+  it("attaches after a multi-part upload too", async () => {
+    const res = await dispatch("upload_file", {
+      mode: "multi",
+      filename: "a.png",
+      source,
+      attach_to: { block_id: PAGE },
+    });
+    assertOk(res);
+    expect(notionStub.fileUploads.complete).toHaveBeenCalledTimes(1);
+    expect(res.data).toMatchObject({ file_upload_id: "fu-att", block_id: "blk-1" });
+    const block = notionStub.blocks.children.append.mock.calls[0][0].children[0];
+    expect(block.image.file_upload).toEqual({ id: "fu-att" });
+  });
+
+  it("keeps the file_upload_id in the error when the append fails", async () => {
+    notionStub.blocks.children.append.mockRejectedValue(new Error("Could not find block"));
+    const res = await dispatch("upload_file", {
+      filename: "a.png",
+      source,
+      attach_to: { block_id: PAGE },
+    });
+    assertErr(res);
+    expect(res.error.code).toBe("attach_failed");
+    expect(res.error.message).toContain("fu-att");
+    expect(res.error.message).toContain("Could not find block");
+    expect(res.error.fix).toContain("append_blocks");
+    expect(res.error.fix).toContain("fu-att");
+    expect(res.error.fix).toContain('"image"');
   });
 });

@@ -15,38 +15,111 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Node.js
-        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "24" # ships with npm >= 11.5 (required for Trusted Publishing)
           registry-url: "https://registry.npmjs.org"
 
-      - name: Ensure npm supports the release-age cooldown
-        # min-release-age in .npmrc is silently ignored by npm < 11.10.0. setup-node
-        # may ship an older npm, which would let `npm install` below pull a
-        # freshly-published (possibly poisoned) version that a dev machine running
-        # current npm would refuse. Upgrade so the cooldown is actually enforced.
+      - name: Ensure npm is current
+        # Kept (unlike in ci.yml) because publishing has its own reason to be on
+        # a current npm: Trusted Publishing / OIDC provenance. node-version 24 is
+        # already meant to satisfy that floor; this guarantees it. A broken
+        # release costs far more than the 15s.
         run: npm install -g npm@latest
 
       - name: Install dependencies
+        # `npm ci` (not `npm install`): the published tarball must be built and
+        # tested against exactly the reviewed lockfile. `npm install` re-resolves
+        # the graph and rewrites the lock in place, so what we shipped was built
+        # from a tree nobody reviewed.
+        #
+        # The previous comment here said npm 11+ strict mode rejected the
+        # lockfile for missing Linux-only optional native deps. That is no longer
+        # true — the committed lock carries them (@rolldown/binding-linux-*,
+        # lightningcss-linux-*, @emnapi/core), and `npm ci` resolves it on
+        # ubuntu-latest in CI.
+        #
         # --ignore-scripts blocks dependency lifecycle scripts (pre/post-install),
         # the primary npm malware vector (Shai-Hulud, TrapDoor). Our runtime deps
         # have no native build step, so nothing legitimate needs them here; our own
         # build runs explicitly via `npm publish` -> `prepare` below.
-        #
-        # 'npm install' (not 'npm ci') because npm 11+ strict mode rejects the
-        # macOS-generated lockfile for missing Linux-only optional native deps
-        # (e.g. @emnapi/core via @rolldown/binding-wasm32-wasi). Lockfile is still
-        # respected — just non-strictly — and the .npmrc cooldown gates resolution.
-        run: npm install --ignore-scripts --no-audit --no-fund
+        run: npm ci --ignore-scripts --no-audit --no-fund
 
       - name: Audit production dependencies
         run: npm audit --omit=dev --audit-level=high
+
+      - name: Build
+        # tests/cli.test.ts spawns build/index.js, so the build must exist
+        # before the tests run — the same order as ci.yml. `npm publish` still
+        # rebuilds through `prepare`, so what ships is built from the same tree.
+        run: npm run build
 
       - name: Run tests
         run: npm test
 
       - name: Publish to npm
-        run: npm publish
+        # Idempotent: a version already on the registry is left alone instead of
+        # failing the run with EPUBLISHCONFLICT, so the workflow can be re-run by
+        # hand when a later step fails — as the MCP Registry step did for v3.1.0,
+        # after npm itself had accepted the tarball.
+        run: |
+          NAME=$(node -p "require('./package.json').name")
+          VERSION=$(node -p "require('./package.json').version")
+          if npm view "$NAME@$VERSION" version >/dev/null 2>&1; then
+            echo "$NAME@$VERSION is already on npm; skipping publish."
+          else
+            npm publish
+          fi
+
+      - name: Sync server.json version with package.json
+        run: |
+          node -e "
+            const fs = require('fs');
+            const { version } = require('./package.json');
+            const s = JSON.parse(fs.readFileSync('server.json', 'utf8'));
+            s.version = version;
+            for (const p of s.packages) p.version = version;
+            fs.writeFileSync('server.json', JSON.stringify(s, null, 2) + '\n');
+          "
+
+      - name: Install mcp-publisher
+        run: |
+          curl -fsSL "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_linux_amd64.tar.gz" | tar xz mcp-publisher
+
+      - name: Wait for npm to serve the published version
+        # npm's publish pipeline is asynchronous: `npm publish` returns "your
+        # package is being processed" and the version is not fetchable yet. The
+        # MCP Registry validates our package against what registry.npmjs.org
+        # serves, so registering too early fails with "version was not found".
+        # v3.1.0 took about sixteen minutes to appear — far past the five
+        # minutes of retries the step below carried on its own, which failed the
+        # release run even though the npm publish had succeeded.
+        run: |
+          NAME=$(node -p "require('./package.json').name")
+          VERSION=$(node -p "require('./package.json').version")
+          for i in $(seq 1 40); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "https://registry.npmjs.org/$NAME/$VERSION")
+            if [ "$code" = "200" ]; then
+              echo "npm serves $NAME@$VERSION (after $(( (i - 1) * 30 ))s)."
+              exit 0
+            fi
+            sleep 30
+          done
+          echo "::error::npm did not serve $NAME@$VERSION within 20 minutes."
+          exit 1
+
+      - name: Publish to MCP Registry
+        # Still retried: the registry validates the mcpName field against the
+        # package.json served by npm, and its own view of that registry can lag
+        # the check above by a few seconds.
+        run: |
+          ./mcp-publisher login github-oidc
+          for i in 1 2 3 4 5; do
+            ./mcp-publisher publish && exit 0
+            echo "Publish attempt $i failed, retrying in 60s..."
+            sleep 60
+          done
+          exit 1

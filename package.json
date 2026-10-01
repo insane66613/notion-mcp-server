@@ -1,6 +1,7 @@
 {
   "name": "notion-mcp-server",
-  "version": "2.10.0",
+  "version": "3.1.0",
+  "mcpName": "io.github.awkoy/notion-mcp-server",
   "type": "module",
   "bin": {
     "notion-mcp-server": "build/index.js"
@@ -11,6 +12,7 @@
     "watch": "tsc --watch",
     "test": "vitest run",
     "test:watch": "vitest",
+    "e2e": "node --env-file=.env scripts/e2e.mjs",
     "inspector": "npx @modelcontextprotocol/inspector build/index.js -e NOTION_TOKEN=your_notion_token -e NOTION_PAGE_ID=your_notion_page_id"
   },
   "homepage": "https://github.com/awkoy/notion-mcp-server",
@@ -41,7 +43,8 @@
     "build"
   ],
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@modelcontextprotocol/node": "2.0.0",
+    "@modelcontextprotocol/server": "2.0.0",
     "@notionhq/client": "^5.22.0",
     "https-proxy-agent": "9.1.0",
     "node-fetch": "3.3.2",
@@ -51,11 +54,12 @@
     "zod": "^4.4.3"
   },
   "devDependencies": {
+    "@modelcontextprotocol/client": "2.0.0",
     "@types/mdast": "^4.0.4",
     "@types/node": "^26.0.0",
     "shx": "^0.4.0",
-    "typescript": "^6.0.3",
-    "vitest": "^4.1.7"
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.0"
   },
   "engines": {
     "node": ">=20"

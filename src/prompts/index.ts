@@ -1,6 +1,5 @@
 import { z } from "zod";
-import type { GetPromptResult } from "@modelcontextprotocol/sdk/types.js";
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { GetPromptResult, McpServer } from "@modelcontextprotocol/server";
 
 function userMessage(text: string): GetPromptResult {
   return {
@@ -20,7 +19,7 @@ export function registerAllPrompts(server: McpServer): void {
       title: "Create Notion task",
       description:
         "Create a new task page in Notion with optional status and due date.",
-      argsSchema: {
+      argsSchema: z.object({
         title: z.string().describe("Task title."),
         status: z
           .string()
@@ -30,7 +29,7 @@ export function registerAllPrompts(server: McpServer): void {
           .string()
           .optional()
           .describe("Due date as ISO 8601 (YYYY-MM-DD)."),
-      },
+      }),
     },
     ({ title, status, due }) => {
       const propLines = [`- title: ${JSON.stringify(title)}`];
@@ -43,8 +42,8 @@ export function registerAllPrompts(server: McpServer): void {
           ...propLines,
           ``,
           `Steps:`,
-          `1. If you don't already know which database holds tasks, call notion_execute with operation "search_pages" (or query_database against a known tasks DB) to locate it.`,
-          `2. Call notion_execute with operation "create_page" and a payload that sets parent.database_id (or data_source_id) plus a properties object containing Title=${JSON.stringify(title)}${status ? `, Status=${JSON.stringify(status)}` : ""}${due ? `, Due=${JSON.stringify(due)}` : ""}.`,
+          `1. If you don't already know which database holds tasks, call notion_read with operation "search_pages" (or query_database against a known tasks DB) to locate it.`,
+          `2. Call notion_write with operation "create_page" and a payload that sets parent.database_id (or data_source_id) plus a properties object containing Title=${JSON.stringify(title)}${status ? `, Status=${JSON.stringify(status)}` : ""}${due ? `, Due=${JSON.stringify(due)}` : ""}.`,
           `3. Return the new page url to the user.`,
         ].join("\n")
       );
@@ -57,7 +56,7 @@ export function registerAllPrompts(server: McpServer): void {
       title: "Weekly review of completed work",
       description:
         "Summarize tasks marked Done in the last 7 days from a Notion database.",
-      argsSchema: {},
+      argsSchema: z.object({}),
     },
     () =>
       userMessage(
@@ -66,7 +65,7 @@ export function registerAllPrompts(server: McpServer): void {
           ``,
           `Steps:`,
           `1. Identify the tasks database (ask the user if you don't know its id).`,
-          `2. Call notion_execute with operation "query_database" using a filter for Status=Done AND Last edited time (or Created time) on_or_after the date 7 days ago. Sort by last_edited_time descending.`,
+          `2. Call notion_read with operation "query_database" using a filter for Status=Done AND Last edited time (or Created time) on_or_after the date 7 days ago. Sort by last_edited_time descending.`,
           `3. Summarize the results grouped by theme or project, with bullet points and links to each page.`,
         ].join("\n")
       )
@@ -77,9 +76,9 @@ export function registerAllPrompts(server: McpServer): void {
     {
       title: "Find Notion pages by query",
       description: "Search Notion and show the top 5 matching pages.",
-      argsSchema: {
+      argsSchema: z.object({
         query: z.string().describe("Text to search for across page titles."),
-      },
+      }),
     },
     ({ query }) =>
       userMessage(
@@ -87,7 +86,7 @@ export function registerAllPrompts(server: McpServer): void {
           `Find Notion pages matching ${JSON.stringify(query)}.`,
           ``,
           `Steps:`,
-          `1. Call notion_execute with operation "search_pages" and payload { "query": ${JSON.stringify(query)} }.`,
+          `1. Call notion_read with operation "search_pages" and payload { "query": ${JSON.stringify(query)} }.`,
           `2. Take the top 5 results and present them as a numbered list with each page's title and url.`,
           `3. If there are no results, say so plainly.`,
         ].join("\n")
@@ -100,7 +99,7 @@ export function registerAllPrompts(server: McpServer): void {
       title: "Append to daily log",
       description:
         "Append a timestamped paragraph to a daily-log page in Notion.",
-      argsSchema: {
+      argsSchema: z.object({
         date: z
           .string()
           .optional()
@@ -109,7 +108,7 @@ export function registerAllPrompts(server: McpServer): void {
           .string()
           .optional()
           .describe("Text to append; prompt the user if omitted."),
-      },
+      }),
     },
     ({ date, content }) => {
       const pageId = process.env.NOTION_DAILY_LOG_PAGE_ID;
@@ -131,7 +130,7 @@ export function registerAllPrompts(server: McpServer): void {
           ``,
           `Steps:`,
           `1. Compose a paragraph block prefixed with the timestamp (date + current time).`,
-          `2. Call notion_execute with operation "append_blocks" and a payload of { "block_id": "<daily-log page id>", "children": [{ "type": "paragraph", "paragraph": { "rich_text": [{ "type": "text", "text": { "content": "<timestamp> — <content>" } }] } }] }.`,
+          `2. Call notion_write with operation "append_blocks" and a payload of { "block_id": "<daily-log page id>", "children": [{ "type": "paragraph", "paragraph": { "rich_text": [{ "type": "text", "text": { "content": "<timestamp> — <content>" } }] } }] }.`,
           `3. Report back the appended block's id.`,
         ].join("\n")
       );

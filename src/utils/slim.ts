@@ -23,6 +23,8 @@ import type {
   UserObjectResponse,
 } from "@notionhq/client";
 
+import { blockFileRef, propertyFileRef, fileRefsEnabled } from "./file-ref.js";
+
 export type PageResponse = PageObjectResponse | PartialPageObjectResponse;
 export type BlockResponse = BlockObjectResponse | PartialBlockObjectResponse;
 export type DatabaseResponse =
@@ -38,11 +40,11 @@ export type CommentResponse =
 
 export type SearchItemResponse = PageResponse | DatabaseResponse | DataSourceResponse;
 
-function extractRichText(rich: readonly RichTextItemResponse[]): string {
+export function extractRichText(rich: readonly RichTextItemResponse[]): string {
   return rich.map((r) => r.plain_text).join("");
 }
 
-function extractTitle(
+export function extractTitle(
   properties: PageObjectResponse["properties"]
 ): string | undefined {
   for (const value of Object.values(properties)) {
@@ -54,8 +56,11 @@ function extractTitle(
 // Flatten a single Notion property to a primitive (or small object) the LLM
 // can read directly. Returns undefined for empty values so the caller can skip
 // them — keeps the response tight for sparsely populated rows.
+type FileRefContext = { pageId: string; property: string };
+
 function flattenProperty(
-  prop: PageObjectResponse["properties"][string]
+  prop: PageObjectResponse["properties"][string],
+  ctx?: FileRefContext
 ): unknown {
   switch (prop.type) {
     case "title":
@@ -79,9 +84,15 @@ function flattenProperty(
       return prop.people.length ? prop.people.map((p) => p.id) : undefined;
     case "files":
       return prop.files.length
-        ? prop.files.map((f) => {
+        ? prop.files.map((f, i) => {
             if (f.type === "external") return { name: f.name, url: f.external.url };
-            return { name: f.name, url: f.file.url };
+            // A Notion-hosted file gets a ref when refs are on. An external
+            // url is already short and stable, so it passes through either way.
+            const url =
+              fileRefsEnabled() && ctx
+                ? propertyFileRef(ctx.pageId, ctx.property, i)
+                : f.file.url;
+            return { name: f.name, url };
           })
         : undefined;
     case "checkbox":
@@ -138,13 +149,14 @@ function flattenProperty(
 }
 
 function flattenProperties(
-  properties: PageObjectResponse["properties"]
+  properties: PageObjectResponse["properties"],
+  pageId: string
 ): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   for (const [name, value] of Object.entries(properties)) {
     // Skip the title prop — already surfaced as `title`.
     if (value.type === "title") continue;
-    const flat = flattenProperty(value);
+    const flat = flattenProperty(value, { pageId, property: name });
     if (flat !== undefined) out[name] = flat;
   }
   return out;
@@ -166,7 +178,7 @@ export function slimPage(
     ...(page.icon ? { icon: page.icon.type } : {}),
   };
   if (!includeProperties) return base;
-  const props = flattenProperties(page.properties);
+  const props = flattenProperties(page.properties, page.id);
   return Object.keys(props).length ? { ...base, properties: props } : base;
 }
 
@@ -188,22 +200,79 @@ export function slimBlock(block: BlockResponse, verbose = false) {
   if (block.type === "code") {
     return { ...base, language: block.code.language };
   }
+  if (block.type === "table_row") {
+    return { ...base, cells: block.table_row.cells.map((cell) => extractRichText(cell)) };
+  }
+  if (block.type === "table") {
+    return { ...base, table_width: block.table.table_width };
+  }
   if (block.type === "image") {
     const img = block.image;
-    const url = img.type === "external" ? img.external.url : img.file.url;
+    const url =
+      img.type === "external"
+        ? img.external.url
+        : fileRefsEnabled()
+          ? blockFileRef(block.id)
+          : img.file.url;
     return { ...base, image: url };
   }
   return base;
 }
 
-function extractBlockText(block: BlockObjectResponse): string | undefined {
-  // Many block subtypes expose a `rich_text` array under their type key.
-  // Read it via a structural narrow so we don't have to enumerate every variant.
+// Read a rich-text array that arrived through an `unknown` record. Tolerant of
+// items the SDK types don't cover: one malformed entry must not abort a whole
+// page read, since slimBlock is mapped across every block in a response.
+function richTextField(value: unknown): string | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const text = value
+    .map((item) => (item as RichTextItemResponse | null | undefined)?.plain_text)
+    .filter((part): part is string => typeof part === "string")
+    .join("");
+  return text || undefined;
+}
+
+function stringField(value: unknown): string | undefined {
+  return typeof value === "string" && value ? value : undefined;
+}
+
+// table_row keeps its text as an array of per-cell rich-text arrays.
+function cellsField(value: unknown): string | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const cells = value.map((cell) => richTextField(cell));
+  if (!cells.some((cell) => cell !== undefined)) return undefined;
+  return cells.map((cell) => cell ?? "").join(" | ");
+}
+
+// A block's text lives under one of several differently named keys depending on
+// its subtype, so try them in descending order of how well each describes the
+// block. Authored prose first, then the string that identifies the block, then
+// its bare url as a last resort — a block should never come back text-free.
+// Note `code` carries both a `rich_text` source and a `caption`: the source
+// wins, but an empty one has to fall through rather than return "".
+// Only top-level `url` strings are read (bookmark, embed, link_preview), where
+// the url *is* the content; the nested urls on file-backed media are expiring
+// S3 links, and slimBlock surfaces the one that matters (image) on its own.
+const TEXT_FIELDS: readonly (readonly [string, (value: unknown) => string | undefined])[] = [
+  ["rich_text", richTextField],
+  ["title", stringField], // child_page, child_database
+  ["expression", stringField], // equation — LaTeX source, not rich text
+  ["caption", richTextField], // bookmark, embed, image, video, pdf, file, audio
+  ["cells", cellsField], // table_row
+  ["name", stringField], // file — its filename, when it carries no caption
+  ["url", stringField], // bookmark, embed, link_preview
+];
+
+export function extractBlockText(block: BlockObjectResponse): string | undefined {
+  // Read the subtype's payload via a structural narrow so we don't have to
+  // enumerate all 37 block variants.
   const inner = (block as unknown as Record<string, unknown>)[block.type];
   if (typeof inner !== "object" || inner === null) return undefined;
-  const richText = (inner as { rich_text?: unknown }).rich_text;
-  if (!Array.isArray(richText)) return undefined;
-  return extractRichText(richText as RichTextItemResponse[]);
+  const fields = inner as Record<string, unknown>;
+  for (const [key, read] of TEXT_FIELDS) {
+    const text = read(fields[key]);
+    if (text !== undefined) return text;
+  }
+  return undefined;
 }
 
 export function slimDatabase(db: DatabaseResponse, verbose = false) {
@@ -224,6 +293,24 @@ export function slimDatabase(db: DatabaseResponse, verbose = false) {
   };
 }
 
+const MAX_LISTED_OPTIONS = 30;
+
+/** `select: A | B | C`, `relation → <data_source_id>`, or the bare type. */
+export function describePropertyDef(def: { type: string; [key: string]: unknown }): string {
+  if (def.type === "select" || def.type === "multi_select" || def.type === "status") {
+    const options = (def[def.type] as { options?: { name: string }[] } | undefined)?.options ?? [];
+    if (options.length === 0) return def.type;
+    const names = options.slice(0, MAX_LISTED_OPTIONS).map((o) => o.name);
+    const more = options.length - names.length;
+    return `${def.type}: ${names.join(" | ")}${more > 0 ? ` | +${more} more` : ""}`;
+  }
+  if (def.type === "relation") {
+    const target = (def.relation as { data_source_id?: string } | undefined)?.data_source_id;
+    return target ? `relation → ${target}` : "relation";
+  }
+  return def.type;
+}
+
 export function slimDataSource(ds: DataSourceResponse, verbose = false) {
   if (verbose) return ds;
   if (!isFullDataSource(ds)) return { id: ds.id };
@@ -234,11 +321,11 @@ export function slimDataSource(ds: DataSourceResponse, verbose = false) {
     title: extractRichText(ds.title),
     ...(description ? { description } : {}),
     parent: ds.parent,
-    // name → property-type map. Same byte cost as a name-only array but the
-    // type info is what query_database planners actually need (otherwise
-    // callers would have to drop verbose:true just to learn types).
+    // name → property-type map, with the option names for select-like
+    // properties and the target of a relation: exactly what a caller needs to
+    // write a row or a filter without a verbose:true round-trip.
     properties: Object.fromEntries(
-      Object.entries(ds.properties).map(([name, def]) => [name, def.type])
+      Object.entries(ds.properties).map(([name, def]) => [name, describePropertyDef(def)])
     ),
     ...(ds.icon ? { icon: ds.icon.type } : {}),
     ...(ds.in_trash ? { in_trash: true } : {}),
