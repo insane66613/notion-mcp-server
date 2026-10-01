@@ -1,6 +1,9 @@
 import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from "vitest";
 import { Client } from "@modelcontextprotocol/client";
 import { InMemoryTransport } from "@modelcontextprotocol/client";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 // Drive the actual MCP wrapper (notion_read / notion_write / notion_describe) through an
 // in-memory transport pair. This catches plumbing bugs that the unit-level
@@ -19,6 +22,7 @@ const notionStub = {
   },
   comments: { retrieve: vi.fn(), update: vi.fn(), delete: vi.fn() },
   blocks: { children: { append: vi.fn() } },
+  fileUploads: { create: vi.fn(), send: vi.fn(), complete: vi.fn() },
 };
 
 vi.mock("../src/services/notion.js", () => ({
@@ -71,10 +75,15 @@ const textOf = (result: { content: Array<{ type: string; text?: string }> }): st
   result.content.map((c) => c.text ?? "").join("");
 
 describe("MCP wrapper: listTools", () => {
-  it("advertises notion_read, notion_write and notion_describe — and no notion_execute", async () => {
+  it("advertises notion_read, notion_write, connector file upload, and notion_describe — and no notion_execute", async () => {
     const { tools } = await client.listTools();
     const names = tools.map((t) => t.name);
-    expect(names).toEqual(["notion_read", "notion_write", "notion_describe"]);
+    expect(names).toEqual(["notion_read", "notion_write", "notion_upload_file", "notion_describe"]);
+    const upload = tools.find((t) => t.name === "notion_upload_file");
+    expect((upload?.inputSchema as { properties?: Record<string, unknown> }).properties?.file).toMatchObject({
+      type: "string",
+      format: "file",
+    });
   });
 
   it("annotates notion_read as read-only and notion_write as destructive", async () => {
@@ -97,6 +106,40 @@ describe("MCP wrapper: listTools", () => {
     expect(writes.length).toBeGreaterThan(0);
     // notion_describe deliberately takes any string: the menus above suffice.
     expect(enumOf(byName.notion_describe?.inputSchema)).toEqual([]);
+  });
+});
+
+describe("MCP wrapper: notion_upload_file", () => {
+  it("turns an MCP-transferred file path into the upstream upload_file path source", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "notion-mcp-upload-"));
+    const path = join(dir, "probe.pdf");
+    await writeFile(path, Buffer.from("%PDF-1.4\nprobe"));
+    notionStub.fileUploads.create.mockResolvedValue({ id: "fu-probe", status: "pending" });
+    notionStub.fileUploads.send.mockResolvedValue({
+      id: "fu-probe",
+      status: "uploaded",
+      filename: "probe.pdf",
+      content_type: "application/pdf",
+    });
+    try {
+      const result = await client.callTool({
+        name: "notion_upload_file",
+        arguments: { file: path },
+      });
+      expect(result.isError).toBeFalsy();
+      expect(readJson(result as Parameters<typeof readJson>[0])).toMatchObject({
+        ok: true,
+        data: { file_upload_id: "fu-probe", status: "uploaded" },
+      });
+      expect(notionStub.fileUploads.create).toHaveBeenCalledWith({
+        mode: "single_part",
+        filename: "probe.pdf",
+        content_type: "application/pdf",
+      });
+      expect(notionStub.fileUploads.send).toHaveBeenCalledTimes(1);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });
 

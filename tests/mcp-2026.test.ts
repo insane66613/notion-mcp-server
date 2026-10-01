@@ -268,11 +268,11 @@ describe("2026-07-28 over HTTP: the wire", () => {
     expect(index.cacheScope).toBe("private");
   });
 
-  it("lists the tools read → write → describe, without a session", async () => {
+  it("lists the tools read → write → upload → describe, without a session", async () => {
     const raw = await modernPost("tools/list");
     expect(raw.headers["mcp-session-id"]).toBeUndefined();
     const names = reply(raw).result!.tools.map((t: { name: string }) => t.name);
-    expect(names).toEqual(["notion_read", "notion_write", "notion_describe"]);
+    expect(names).toEqual(["notion_read", "notion_write", "notion_upload_file", "notion_describe"]);
   });
 
   it("has no standalone stream and no session to end: GET/DELETE are 405", async () => {
@@ -345,7 +345,7 @@ describe("2026-07-28 over HTTP: SDK client", () => {
 
   it("negotiates the pinned revision and lists the tools", async () => {
     const { tools } = await asking.client.listTools();
-    expect(tools.map((t) => t.name)).toEqual(["notion_read", "notion_write", "notion_describe"]);
+    expect(tools.map((t) => t.name)).toEqual(["notion_read", "notion_write", "notion_upload_file", "notion_describe"]);
   });
 
   it("confirms a destructive call through input_required and the retry", async () => {
@@ -465,7 +465,7 @@ describe("2025-era clients on the same endpoint", () => {
     try {
       expect(transport.sessionId).toBeTruthy();
       const { tools } = await legacy.client.listTools();
-      expect(tools).toHaveLength(3);
+      expect(tools).toHaveLength(4);
       await withFlag("true", async () => {
         const body = await callWrite(legacy.client, ARCHIVE);
         expect(legacy.prompts).toHaveLength(1);
@@ -501,7 +501,7 @@ describe("stdio through serveStdio", () => {
     const legacy = await connectStdio({});
     try {
       const { tools } = await legacy.client.listTools();
-      expect(tools).toHaveLength(3);
+      expect(tools).toHaveLength(4);
       await withFlag("true", async () => {
         expect((await callWrite(legacy.client, ARCHIVE)).ok).toBe(true);
         expect(legacy.prompts).toHaveLength(1);
@@ -515,7 +515,7 @@ describe("stdio through serveStdio", () => {
     const modern = await connectStdio({ versionNegotiation: { mode: { pin: MODERN } } });
     try {
       const { tools } = await modern.client.listTools();
-      expect(tools.map((t) => t.name)).toEqual(["notion_read", "notion_write", "notion_describe"]);
+      expect(tools.map((t) => t.name)).toEqual(["notion_read", "notion_write", "notion_upload_file", "notion_describe"]);
       const read = await modern.client.callTool({
         name: "notion_read",
         arguments: { operation: "get_page", payload: { page_id: "p-1" } },

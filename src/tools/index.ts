@@ -6,6 +6,7 @@ import type {
 } from "@modelcontextprotocol/server";
 import { ResourceTemplate, isInputRequiredResult } from "@modelcontextprotocol/server";
 import { z } from "zod";
+import { fileURLToPath } from "node:url";
 import { readNotionResource } from "./resources.js";
 import { getOperation } from "../operations/index.js";
 import type { OperationAccess } from "../operations/types.js";
@@ -68,6 +69,18 @@ const PAYLOAD_FIELD = z
   .describe(
     "Operation parameters. Pass either single-op fields directly, or { items: [...], atomic?, idempotency_key?, concurrency? } for batch."
   );
+
+const CONNECTOR_FILE = z
+  .string()
+  .meta({ format: "file" })
+  .describe(
+    "A user-supplied file transferred by the MCP client. Use this argument for ChatGPT file uploads."
+  );
+
+function connectorPath(file: string): string {
+  const trimmed = file.trim();
+  return trimmed.startsWith("file://") ? fileURLToPath(trimmed) : trimmed;
+}
 
 // The error a client sees when it names an operation the enum does not carry.
 // The SDK reports a schema mismatch as an InvalidParams JSON-RPC error whose
@@ -213,9 +226,56 @@ function registerOperationTool(server: McpServer, access: OperationAccess): void
   );
 }
 
+function registerConnectorFileTool(server: McpServer): void {
+  if (!isOperationAllowed("upload_file")) return;
+  server.registerTool(
+    "notion_upload_file",
+    {
+      title: "Upload File to Notion",
+      description:
+        "Upload a file transferred by the MCP client. This compatibility tool marks `file` with JSON Schema format `file`, then delegates to the normal upload_file operation so ChatGPT can transfer local attachments without base64 encoding.",
+      inputSchema: z.object({
+        file: CONNECTOR_FILE,
+        mode: z.enum(["single", "multi"]).optional(),
+        page_id: z.string().optional().describe("Optional page or block to attach the uploaded file to."),
+        filename: z.string().optional().describe("Optional filename override."),
+        content_type: z.string().optional().describe("Optional MIME type override."),
+        caption: z.string().optional().describe("Optional caption when page_id is supplied."),
+        position: z.enum(["start", "end"]).optional().describe("Optional placement when page_id is supplied."),
+        after: z.string().optional().describe("Optional block id to insert after when page_id is supplied."),
+      }),
+      annotations: {
+        title: "Upload File to Notion",
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: true,
+      },
+    },
+    ({ file, mode, page_id, filename, content_type, caption, position, after }, ctx) => {
+      const attach_to = page_id
+        ? {
+            block_id: page_id,
+            ...(caption ? { caption } : {}),
+            ...(position ? { position } : {}),
+            ...(after ? { after } : {}),
+          }
+        : undefined;
+      return runOperation(server, ctx, "notion_upload_file", "upload_file", {
+        source: { type: "path", path: connectorPath(file) },
+        ...(mode ? { mode } : {}),
+        ...(filename ? { filename } : {}),
+        ...(content_type ? { content_type } : {}),
+        ...(attach_to ? { attach_to } : {}),
+      });
+    }
+  );
+}
+
 export function registerAllTools(server: McpServer): void {
   registerOperationTool(server, "read");
   registerOperationTool(server, "write");
+  registerConnectorFileTool(server);
 
   // notion_describe takes a plain string: the read and write enums above are
   // already the menu, and repeating all of them here would cost every session
