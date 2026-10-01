@@ -412,6 +412,65 @@ describe("search_pages", () => {
       ["data_source", "ds-tasks"],
     ]);
   });
+
+  it("re-ranks broad Notion token matches by normalized title relevance", async () => {
+    notionStub.search.mockResolvedValue({
+      object: "list",
+      results: [
+        { object: "page", id: "cloud-email", url: "u1", parent: { type: "workspace", workspace: true }, properties: { title: { type: "title", title: [{ plain_text: "Email from City of St. Cloud" }] } } },
+        { object: "page", id: "other", url: "u2", parent: { type: "workspace", workspace: true }, properties: { title: { type: "title", title: [{ plain_text: "Migration notes 2026" }] } } },
+        { object: "page", id: "target", url: "u3", parent: { type: "workspace", workspace: true }, properties: { title: { type: "title", title: [{ plain_text: "ARCHIVE — MIGRATION COPY — Sanity-Cloud-InScene Migration — 2026-07-29" }] } } },
+      ],
+      has_more: true,
+      next_cursor: "raw-next",
+    });
+
+    const res = (await dispatch("search_pages", {
+      query: "ARCHIVE MIGRATION COPY Sanity-Cloud-InScene Migration 2026-07-29",
+      page_size: 2,
+    })) as Ok;
+    const data = res.data as {
+      results: { id: string }[];
+      ranking: string;
+      candidates_considered: number;
+      source_has_more: boolean;
+    };
+    expect(data.results.map((r) => r.id)).toEqual(["target", "other"]);
+    expect(data.ranking).toBe("local_title_relevance");
+    expect(data.candidates_considered).toBe(3);
+    expect(data.source_has_more).toBe(true);
+    expect(notionStub.search).toHaveBeenCalledWith({
+      query: "ARCHIVE MIGRATION COPY Sanity-Cloud-InScene Migration 2026-07-29",
+      page_size: 100,
+    });
+  });
+
+  it("preserves raw Notion ordering when an explicit sort is requested", async () => {
+    notionStub.search.mockResolvedValue({
+      object: "list",
+      results: [
+        { object: "page", id: "first", url: "u1", parent: { type: "workspace", workspace: true }, properties: { title: { type: "title", title: [{ plain_text: "First" }] } } },
+        { object: "page", id: "target", url: "u2", parent: { type: "workspace", workspace: true }, properties: { title: { type: "title", title: [{ plain_text: "Sanity-Cloud-InScene" }] } } },
+      ],
+      has_more: false,
+      next_cursor: null,
+    });
+
+    const res = (await dispatch("search_pages", {
+      query: "Sanity-Cloud-InScene",
+      page_size: 2,
+      sort_direction: "descending",
+    })) as Ok;
+    const data = res.data as { results: { id: string }[]; ranking?: string };
+    expect(data.results.map((r) => r.id)).toEqual(["first", "target"]);
+    expect(data.ranking).toBeUndefined();
+    expect(notionStub.search).toHaveBeenCalledWith({
+      query: "Sanity-Cloud-InScene",
+      sort: { direction: "descending", timestamp: "last_edited_time" },
+      page_size: 2,
+      start_cursor: undefined,
+    });
+  });
 });
 
 describe("update_block partial data", () => {

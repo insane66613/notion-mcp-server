@@ -435,6 +435,46 @@ register({
 // search_pages
 // ──────────────────────────────────────────────────────────────────────────
 
+function normalizeTitleSearch(value: string): string {
+  return value
+    .normalize("NFKD")
+    .toLowerCase()
+    .replace(/[\p{P}\p{S}]+/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function titleSearchScore(title: unknown, query: string): number {
+  if (typeof title !== "string") return 0;
+  const normalizedTitle = normalizeTitleSearch(title);
+  const normalizedQuery = normalizeTitleSearch(query);
+  if (!normalizedTitle || !normalizedQuery) return 0;
+  if (normalizedTitle === normalizedQuery) return 1_000_000;
+
+  let score = 0;
+  const phraseIndex = normalizedTitle.indexOf(normalizedQuery);
+  if (phraseIndex >= 0) score += 100_000 - Math.min(phraseIndex, 1_000);
+  if (normalizedTitle.startsWith(normalizedQuery)) score += 50_000;
+
+  const queryTokens = [...new Set(normalizedQuery.split(" ").filter(Boolean))];
+  const titleTokens = new Set(normalizedTitle.split(" ").filter(Boolean));
+  const matched = queryTokens.filter((token) => titleTokens.has(token)).length;
+  score += matched * 1_000;
+  score += Math.round((matched / queryTokens.length) * 10_000);
+  return score;
+}
+
+function rankTitleSearch<T>(items: T[], query: string): T[] {
+  return items
+    .map((item, index) => ({
+      item,
+      index,
+      score: titleSearchScore((item as { title?: unknown }).title, query),
+    }))
+    .sort((a, b) => b.score - a.score || a.index - b.index)
+    .map(({ item }) => item);
+}
+
 const SearchPagesParams = z.object({
   query: z.string().optional().describe("Title substring. Notion search is title-only — it does not search page body content."),
   sort_direction: z.enum(["ascending", "descending"]).optional(),
@@ -458,7 +498,7 @@ register({
   access: "read",
   domain: "pages",
   description:
-    "Search pages and databases by title. Title-only; does NOT search page body content. Each result carries `object` (page | database | data_source). Pass paginate:true to auto-walk all pages.",
+    "Search pages and databases by title. Title-only; does NOT search page body content. Default query mode re-ranks up to 100 Notion candidates by normalized title relevance so exact and phrase matches beat broad token matches. Pass paginate:true, sort_direction, or start_cursor to preserve raw Notion ordering/pagination.",
   batchable: false,
   schema: SearchPagesParams,
   example: { query: "smoke test", page_size: 10 },
@@ -497,8 +537,30 @@ register({
       };
     }
 
+    const normalizedQuery = query?.trim() ?? "";
+    if (normalizedQuery && !sort_direction && !start_cursor) {
+      const requested = page_size ?? 10;
+      const response = await notion.search({
+        query: normalizedQuery,
+        page_size: 100,
+      });
+      const candidates = response.results.map((item) => slimKind(item, verbose ?? false));
+      const ranked = rankTitleSearch(candidates, normalizedQuery);
+      return {
+        ok: true,
+        data: {
+          results: ranked.slice(0, requested),
+          has_more: false,
+          next_cursor: null,
+          ranking: "local_title_relevance",
+          candidates_considered: candidates.length,
+          source_has_more: response.has_more,
+        },
+      };
+    }
+
     const response = await notion.search({
-      query: query ?? "",
+      query: normalizedQuery,
       ...sort,
       page_size: page_size ?? 10,
       start_cursor,
