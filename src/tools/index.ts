@@ -20,6 +20,7 @@ import { emitJsonSchema } from "../schema/emit.js";
 import { registerAllPrompts } from "../prompts/index.js";
 import { confirmDestructiveCall } from "./confirm.js";
 import { log } from "../utils/log.js";
+import { TOOL_PAYLOAD_SCHEMA, normalizeToolPayload } from "./arguments.js";
 
 /**
  * SEP-2549 cache hints for a 2026-07-28 client. What the server lists (tools,
@@ -63,11 +64,9 @@ export const TOOL_BY_ACCESS: Record<OperationAccess, string> = {
   write: "notion_write",
 };
 
-const PAYLOAD_FIELD = z
-  .record(z.string(), z.unknown())
-  .describe(
-    "Operation parameters. Pass either single-op fields directly, or { items: [...], atomic?, idempotency_key?, concurrency? } for batch."
-  );
+const PAYLOAD_FIELD = TOOL_PAYLOAD_SCHEMA.describe(
+  "Operation parameters. Pass either single-op fields directly, or { items: [...], atomic?, idempotency_key?, concurrency? } for batch. JSON-encoded object strings are accepted for client compatibility."
+);
 
 // The error a client sees when it names an operation the enum does not carry.
 // The SDK reports a schema mismatch as an InvalidParams JSON-RPC error whose
@@ -209,7 +208,8 @@ function registerOperationTool(server: McpServer, access: OperationAccess): void
             openWorldHint: true,
           },
     },
-    ({ operation, payload }, ctx) => runOperation(server, ctx, tool, operation, payload)
+    ({ operation, payload }, ctx) =>
+      runOperation(server, ctx, tool, operation, normalizeToolPayload(payload))
   );
 }
 
@@ -364,28 +364,28 @@ function renderOperationsIndex(): string {
     "",
     "```jsonc",
     "// Single equality (property type inferred from value, or from data source schema via __type):",
-    "{ \"where\": { \"Status\": \"Open\" } }",
+    '{ "where": { "Status": "Open" } }',
     "",
     "// AND of multiple properties (top-level keys are implicit AND):",
-    "{ \"where\": { \"Status\": \"Done\", \"Done\": true } }",
+    '{ "where": { "Status": "Done", "Done": true } }',
     "",
     "// Explicit operator on one property:",
-    "{ \"where\": { \"Priority\": { \"gte\": 3 } } }",
+    '{ "where": { "Priority": { "gte": 3 } } }',
     "",
     "// Boolean groups (lowercase or uppercase — both work):",
-    "{ \"where\": { \"or\": [ { \"Status\": \"Open\" }, { \"Status\": \"In progress\" } ] } }",
-    "{ \"where\": { \"and\": [ { \"Status\": \"Done\" }, { \"Priority\": { \"gte\": 5 } } ] } }",
-    "{ \"where\": { \"not\": { \"Status\": \"Done\" } } }",
+    '{ "where": { "or": [ { "Status": "Open" }, { "Status": "In progress" } ] } }',
+    '{ "where": { "and": [ { "Status": "Done" }, { "Priority": { "gte": 5 } } ] } }',
+    '{ "where": { "not": { "Status": "Done" } }',
     "",
     "// in / notIn fan out to OR / AND of equals:",
-    "{ \"where\": { \"Status\": { \"in\": [\"Open\", \"In progress\"] } } }",
+    '{ "where": { "Status": { "in": ["Open", "In progress"] } }',
     "",
     "// Force property type when value shape is ambiguous (e.g. a string that's actually a multi_select tag):",
-    "{ \"where\": { \"Tags\": { \"__type\": \"multi_select\", \"eq\": \"alpha\" } } }",
-    "{ \"where\": { \"Created\": { \"__type\": \"date\", \"on_or_after\": \"2026-01-01\" } } }",
+    '{ "where": { "Tags": { "__type": "multi_select", "eq": "alpha" } }',
+    '{ "where": { "Created": { "__type": "date", "on_or_after": "2026-01-01" } }',
     "```",
     "",
-    "If a column is literally named `and`/`or`/`not`, wrap it as an operator object (e.g. `{ \"and\": { \"__type\": \"select\", \"eq\": \"x\" } }`) so it isn't parsed as a combinator. For anything the DSL can't express, pass `filter` (raw Notion filter object) instead of `where`."
+    "If a column is literally named `and`/`or`/`not`, wrap it as an operator object (e.g. `{ "and": { "__type": "select", "eq": "x" } }`) so it isn't parsed as a combinator. For anything the DSL can't express, pass `filter` (raw Notion filter object) instead of `where`."
   );
   return lines.join("\n");
 }
