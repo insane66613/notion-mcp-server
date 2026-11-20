@@ -157,6 +157,39 @@ function compileViewFilter(
   return { ok: true };
 }
 
+// Notion often returns property IDs, not property names, in saved view filters.
+// Data source property IDs may themselves be percent-encoded in API responses.
+// Canonicalize both filters against the same source schema before declaring an
+// exact match, otherwise a safe rerun can spuriously conflict with its own view.
+function canonicalViewFilter(
+  filter: unknown,
+  properties: Record<string, { id?: string }> = {}
+): string {
+  const decodeId = (value: string): string => {
+    try { return decodeURIComponent(value); } catch { return value; }
+  };
+  const aliases = new Map<string, string>();
+  for (const [name, config] of Object.entries(properties)) {
+    const id = decodeId(config.id ?? name);
+    aliases.set(name, id);
+    if (config.id) aliases.set(config.id, id);
+    aliases.set(id, id);
+  }
+  const normalize = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(normalize);
+    if (!value || typeof value !== "object") return value;
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([key, item]) => [
+        key,
+        key === "property" && typeof item === "string"
+          ? (aliases.get(item) ?? item)
+          : normalize(item),
+      ])
+    );
+  };
+  return stableStringify(normalize(filter ?? null));
+}
+
 // ──────────────────────────────────────────────────────────────────────────
 // get_view
 // ──────────────────────────────────────────────────────────────────────────
@@ -590,10 +623,20 @@ register({
       filter?: unknown; dashboard_view_id?: string;
     }>;
     const sameName = fullViews.filter((item) => item.name === name);
-    const expectedFilter = stableStringify(compiled.filter ?? null);
+    // A saved filter can refer to an ID while the input used a property name.
+    // Resolve the source schema only when comparing an existing named widget.
+    const needsPropertyMapping = sameName.length > 0 &&
+      (compiled.filter != null || sameName.some((item) => item.filter != null));
+    const source = needsPropertyMapping
+      ? await notion.dataSources.retrieve({ data_source_id })
+      : null;
+    const properties = (source as {
+      properties?: Record<string, { id?: string }>
+    } | null)?.properties ?? {};
+    const expectedFilter = canonicalViewFilter(compiled.filter, properties);
     const matches = sameName.filter((item) =>
       item.type === type && item.data_source_id === data_source_id &&
-      stableStringify(item.filter ?? null) === expectedFilter
+      canonicalViewFilter(item.filter, properties) === expectedFilter
     );
     if (sameName.length > 0 && (sameName.length !== 1 || matches.length !== 1))
       return { ok: false, error: {

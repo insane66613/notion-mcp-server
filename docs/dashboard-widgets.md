@@ -25,8 +25,10 @@ be nested as a widget.
 ## Idempotent reconciliation
 
 Use `ensure_dashboard_widget` for repeated automation, first with `dry_run:true`.
-It checks the dashboard's widget memberships; an exact name + source + view type
-+ saved filter returns action `existing`. If the name matches but any of those
+It checks the Dashboard's widget memberships; an exact name + source + view type
++ saved filter returns action `existing`. Saved filter property IDs are normalized
+against the source schema, so filters supplied with property names also match
+their API-returned internal IDs. If the name matches but any of those
 properties differ, it fails closed with `dashboard_widget_conflict`.
 It never assumes a name match proves the filter or source is correct.
 
@@ -49,5 +51,5 @@ and connection permissions may still reject Dashboard API writes.
 - Create an isolated Dashboard widget with explicit source and filter
 - Read back widget `dashboard_view_id` and Dashboard membership row
 - Re-run ensure, confirm `action:existing` and no second widget
-- Preserve the SanityCloud managed multi-account wrapper, safety blocks,
-  idempotency state and rollback artifact
+- Preserve the caller's authorization boundaries and write controls
+- Review the returned ID before retrying an indeterminate network outcome
