@@ -1,11 +1,22 @@
 import { z } from "zod";
+import { isFullPage, type PageObjectResponse } from "@notionhq/client";
 import { getClient } from "../services/notion.js";
+import { clearWrite } from "../services/call-context.js";
 import { register } from "./registry.js";
 import { tryHandler } from "../utils/handler.js";
-import { slimPage, slimItem, slimList } from "../utils/slim.js";
-import { paginateAll } from "../utils/paginate.js";
+import { toErrorEnvelope } from "../utils/error.js";
+import {
+  incompleteListProperties,
+  isIncompleteListProperty,
+  PAGE_PROPERTY_REFERENCE_LIMIT,
+  slimPage,
+  slimItem,
+  slimList,
+} from "../utils/slim.js";
+import { DEFAULT_PAGE_LIMIT, paginateAll } from "../utils/paginate.js";
 import type { OperationError, OperationResult } from "./types.js";
 import { parseMarkdownToBlocks } from "../markdown/parse.js";
+import { appendBlockTree, nextBlockRequest } from "../utils/write-blocks.js";
 import { PARENT_SCHEMA } from "../schema/page.js";
 import { ICON_SCHEMA } from "../schema/icon.js";
 import { FILE_SCHEMA } from "../schema/file.js";
@@ -30,6 +41,49 @@ import { normalizeNotionId, notionId } from "../schema/id.js";
 
 const VERBOSE = z.boolean().optional();
 
+const NOTIFICATIONS = z
+  .object({
+    mode: z
+      .enum(["default", "silent"])
+      .describe("`silent` skips page update, @mention and Person property notifications for this change. `default` is Notion's standard behaviour."),
+  })
+  .optional()
+  .describe("Controls the notifications Notion sends people about this change. Omit for the standard behaviour. Database automations, reminders and connection webhooks still run, and page history and audit logs still record the change.");
+
+const FILTER_PROPERTIES = z
+  .array(z.string().min(1))
+  .min(1)
+  .optional()
+  .describe(
+    "Property names or ids to return from Notion; the rest are left out of the response. Only changes what `verbose: true` shows, since the default response carries no properties. `title` is kept unless verbose is set."
+  );
+
+/**
+ * The query part of a request that takes Notion's filter_properties.
+ *
+ * The slim page and title ranking read the title property, so a filter that
+ * left it out would blank the title; `title` is the fixed id of every title
+ * property, whatever it is named. The SDK runs each value through
+ * decodeURIComponent, because property ids arrive percent-encoded, and that
+ * throws on a name with a bare `%`, so such a name is encoded first.
+ */
+function filterPropertiesQuery(
+  filter: readonly string[] | undefined,
+  keepTitle: boolean
+): { filter_properties?: string[] } {
+  if (!filter) return {};
+  const names = keepTitle && !filter.includes("title") ? [...filter, "title"] : filter;
+  return {
+    filter_properties: names.map((name) => {
+      try {
+        decodeURIComponent(name);
+        return name;
+      } catch {
+        return encodeURIComponent(name);
+      }
+    }),
+  };
+}
 
 function resolveParent(
   parent: z.infer<typeof PARENT_SCHEMA> | undefined
@@ -93,6 +147,8 @@ const CreatePageParams = z
       .describe("Create the page from a Notion template. The API forbids `markdown`/`children` alongside a template; only data_source_id parents support templates."),
     icon: ICON_SCHEMA.nullable().optional(),
     cover: FILE_SCHEMA.nullable().optional(),
+    notifications: NOTIFICATIONS,
+    filter_properties: FILTER_PROPERTIES,
     verbose: VERBOSE,
   })
   .refine((v) => !(v.markdown && v.children), {
@@ -190,19 +246,84 @@ register({
         ? parseMarkdownToBlocks(params.markdown)
         : params.children;
 
+    // The page carries the leading blocks that fit in one request whole;
+    // pages.create returns no block ids, so a block whose children have to
+    // follow later starts the part appended after it.
+    let inline = children ?? [];
+    let tail: typeof inline = [];
+    if (inline.length) {
+      const first = nextBlockRequest(inline);
+      const cut = first.later.length ? first.later[0].index : first.send.length;
+      tail = inline.slice(cut);
+      inline = inline.slice(0, cut);
+    }
+
     const notion = await getClient();
     const body = {
       parent: rowParent,
       properties,
-      ...(children && children.length ? { children } : {}),
+      ...(inline.length ? { children: inline } : {}),
       ...(params.template ? { template: params.template } : {}),
       ...(params.icon !== undefined ? { icon: params.icon } : {}),
       ...(params.cover !== undefined ? { cover: params.cover } : {}),
+      ...(params.notifications ? { notifications: params.notifications } : {}),
+      ...filterPropertiesQuery(params.filter_properties, !params.verbose),
     };
     const response = await notion.pages.create(asSdk<CreatePageBody>(body));
+    if (tail.length) {
+      const failed = await appendBlockTree(notion, response.id, tail, undefined, params.notifications).then(
+        () => undefined,
+        (error: unknown) => error
+      );
+      if (failed !== undefined) return abandonPartialPage(notion, response.id, failed, params.notifications);
+    }
     return withWarnings({ ok: true, data: slimPage(response, params.verbose ?? false) }, warnings);
   }),
 });
+
+/**
+ * A page whose content ran past Notion's per-request limits is written in
+ * several requests. When a later one fails, trash the page, so the failed
+ * call leaves nothing behind and a retry doesn't make a second copy.
+ */
+async function abandonPartialPage(
+  notion: Awaited<ReturnType<typeof getClient>>,
+  pageId: string,
+  failure: unknown,
+  notifications: UpdatePageBody["notifications"]
+): Promise<OperationResult> {
+  const envelope = toErrorEnvelope(failure);
+  const trashed = await notion.pages
+    .update(
+      asSdk<UpdatePageBody>({
+        page_id: pageId,
+        in_trash: true,
+        ...(notifications ? { notifications } : {}),
+      })
+    )
+    .then(
+      () => true,
+      () => false
+    );
+  // A trashed page is the whole of what the call wrote, so a retry is safe.
+  if (trashed) clearWrite();
+  return {
+    ok: false,
+    error: {
+      ...envelope,
+      message: trashed
+        ? `${envelope.message} The content was too large or too deeply nested for one request, and writing the rest of it after the page was created failed, so the page (${pageId}) was moved to trash.`
+        : `${envelope.message} The content was too large or too deeply nested for one request, and writing the rest of it after the page was created failed. Moving the page to trash failed too, so page ${pageId} is left with part of its content.`,
+      ...(envelope.fix || !trashed
+        ? {
+            fix: [envelope.fix, trashed ? undefined : `Trash page ${pageId} with trash_page before retrying.`]
+              .filter(Boolean)
+              .join(" "),
+          }
+        : {}),
+    },
+  };
+}
 
 // ──────────────────────────────────────────────────────────────────────────
 // set_page_title
@@ -211,6 +332,8 @@ register({
 const SetPageTitleParams = z.object({
   page_id: notionId(),
   title: z.string(),
+  notifications: NOTIFICATIONS,
+  filter_properties: FILTER_PROPERTIES,
   verbose: VERBOSE,
 });
 
@@ -228,7 +351,7 @@ register({
       { page_id: "<page-id-2>", title: "Renamed 2" },
     ],
   },
-  handler: tryHandler(async ({ page_id, title, verbose }) => {
+  handler: tryHandler(async ({ page_id, title, notifications, filter_properties, verbose }) => {
     const notion = await getClient();
     const response = await notion.pages.update(
       asSdk<UpdatePageBody>({
@@ -236,6 +359,8 @@ register({
         properties: {
           title: { title: [{ type: "text", text: { content: title } }] },
         },
+        ...(notifications ? { notifications } : {}),
+        ...filterPropertiesQuery(filter_properties, !verbose),
       })
     );
     return { ok: true, data: slimPage(response, verbose ?? false) };
@@ -267,6 +392,8 @@ const SetPagePropertyParams = z.preprocess(
     page_id: notionId(),
     name: z.string().describe("Property name as shown in Notion. `title` always addresses the title property."),
     value: PROPERTY_VALUE_SCHEMA,
+    notifications: NOTIFICATIONS,
+    filter_properties: FILTER_PROPERTIES,
     verbose: VERBOSE,
   })
 );
@@ -290,12 +417,17 @@ register({
       { page_id: "<page-id>", name: "Score", value: 42 },
     ],
   },
-  handler: tryHandler(async ({ page_id, name, value, verbose }) => {
+  handler: tryHandler(async ({ page_id, name, value, notifications, filter_properties, verbose }) => {
     const prepared = await prepareProperties({ [name]: value }, () => rowSchemaForPage(page_id));
     if (!prepared.ok) return prepared;
     const notion = await getClient();
     const response = await notion.pages.update(
-      asSdk<UpdatePageBody>({ page_id, properties: prepared.properties })
+      asSdk<UpdatePageBody>({
+        page_id,
+        properties: prepared.properties,
+        ...(notifications ? { notifications } : {}),
+        ...filterPropertiesQuery(filter_properties, !verbose),
+      })
     );
     return withWarnings({ ok: true, data: slimPage(response, verbose ?? false) }, prepared.warnings);
   }),
@@ -336,6 +468,8 @@ const SetPagePropertiesParams = z.preprocess(
       .describe(
         "Property name → value, written in one API call. Plain values are typed from the data source schema: { Status: 'Done', Score: 42, Done: true, 'Due Date': '2026-01-01', Tags: ['a', 'b'], Notes: null }."
       ),
+    notifications: NOTIFICATIONS,
+    filter_properties: FILTER_PROPERTIES,
     verbose: VERBOSE,
   })
 );
@@ -363,12 +497,17 @@ register({
       { page_id: "<page-id-2>", properties: { Status: "Done" } },
     ],
   },
-  handler: tryHandler(async ({ page_id, properties, verbose }) => {
+  handler: tryHandler(async ({ page_id, properties, notifications, filter_properties, verbose }) => {
     const prepared = await prepareProperties(properties, () => rowSchemaForPage(page_id));
     if (!prepared.ok) return prepared;
     const notion = await getClient();
     const response = await notion.pages.update(
-      asSdk<UpdatePageBody>({ page_id, properties: prepared.properties })
+      asSdk<UpdatePageBody>({
+        page_id,
+        properties: prepared.properties,
+        ...(notifications ? { notifications } : {}),
+        ...filterPropertiesQuery(filter_properties, !verbose),
+      })
     );
     return withWarnings({ ok: true, data: slimPage(response, verbose ?? false) }, prepared.warnings);
   }),
@@ -378,12 +517,22 @@ register({
 // archive_page / restore_page
 // ──────────────────────────────────────────────────────────────────────────
 
-const PageIdParams = z.object({ page_id: notionId(), verbose: VERBOSE });
+const PageIdParams = z.object({
+  page_id: notionId(),
+  notifications: NOTIFICATIONS,
+  filter_properties: FILTER_PROPERTIES,
+  verbose: VERBOSE,
+});
 
-const archivePageHandler = tryHandler(async ({ page_id, verbose }: z.infer<typeof PageIdParams>) => {
+const archivePageHandler = tryHandler(async ({ page_id, notifications, filter_properties, verbose }: z.infer<typeof PageIdParams>) => {
   const notion = await getClient();
   const response = await notion.pages.update(
-    asSdk<UpdatePageBody>({ page_id, in_trash: true })
+    asSdk<UpdatePageBody>({
+      page_id,
+      in_trash: true,
+      ...(notifications ? { notifications } : {}),
+      ...filterPropertiesQuery(filter_properties, !verbose),
+    })
   );
   return { ok: true as const, data: slimPage(response, verbose ?? false) };
 });
@@ -422,10 +571,15 @@ register({
   batchable: true,
   schema: PageIdParams,
   example: { page_id: "<page-id>" },
-  handler: tryHandler(async ({ page_id, verbose }) => {
+  handler: tryHandler(async ({ page_id, notifications, filter_properties, verbose }) => {
     const notion = await getClient();
     const response = await notion.pages.update(
-      asSdk<UpdatePageBody>({ page_id, in_trash: false })
+      asSdk<UpdatePageBody>({
+        page_id,
+        in_trash: false,
+        ...(notifications ? { notifications } : {}),
+        ...filterPropertiesQuery(filter_properties, !verbose),
+      })
     );
     return { ok: true, data: slimPage(response, verbose ?? false) };
   }),
@@ -435,9 +589,59 @@ register({
 // search_pages
 // ──────────────────────────────────────────────────────────────────────────
 
+// Folding combining marks makes accents optional (`café` finds `Cafe`), but it
+// also merges letters some languages keep apart (`й`/`и`, `ї`/`і`). Ranking
+// therefore scores both ways: folded first, then with marks kept to break ties.
+function normalizeTitleSearch(value: string, foldMarks = true): string {
+  const decomposed = value.normalize("NFKD");
+  return (foldMarks ? decomposed.replace(/\p{M}+/gu, "") : decomposed)
+    .toLowerCase()
+    .replace(/[\p{P}\p{S}]+/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function titleSearchScore(title: unknown, query: string, foldMarks = true): number {
+  if (typeof title !== "string") return 0;
+  const normalizedTitle = normalizeTitleSearch(title, foldMarks);
+  const normalizedQuery = normalizeTitleSearch(query, foldMarks);
+  if (!normalizedTitle || !normalizedQuery) return 0;
+  if (normalizedTitle === normalizedQuery) return 1_000_000;
+
+  let score = 0;
+  const phraseIndex = normalizedTitle.indexOf(normalizedQuery);
+  if (phraseIndex >= 0) score += 100_000 - Math.min(phraseIndex, 1_000);
+  if (normalizedTitle.startsWith(normalizedQuery)) score += 50_000;
+
+  const queryTokens = [...new Set(normalizedQuery.split(" ").filter(Boolean))];
+  const titleTokens = new Set(normalizedTitle.split(" ").filter(Boolean));
+  const matched = queryTokens.filter((token) => titleTokens.has(token)).length;
+  score += matched * 1_000;
+  return score;
+}
+
+function rankTitleSearch<T>(items: T[], query: string, getTitle: (item: T) => unknown): T[] {
+  return items
+    .map((item, index) => {
+      const title = getTitle(item);
+      return {
+        item,
+        index,
+        score: titleSearchScore(title, query),
+        markScore: titleSearchScore(title, query, false),
+      };
+    })
+    .sort((a, b) => b.score - a.score || b.markScore - a.markScore || a.index - b.index)
+    .map(({ item }) => item);
+}
+
 const SearchPagesParams = z.object({
   query: z.string().optional().describe("Title substring. Notion search is title-only — it does not search page body content."),
   sort_direction: z.enum(["ascending", "descending"]).optional(),
+  ranking: z
+    .enum(["notion", "title_relevance"])
+    .optional()
+    .describe("Result ordering. Omit or use notion to preserve Notion's native order. title_relevance re-ranks up to 100 candidates by normalized title match and is incompatible with sort_direction, start_cursor, and paginate=true."),
   page_size: z.number().min(1).max(100).optional(),
   start_cursor: z.string().optional(),
   paginate: z
@@ -450,7 +654,28 @@ const SearchPagesParams = z.object({
     .max(1000)
     .optional()
     .describe("Max pages to fetch when paginate=true (default 10, ~1000 items with page_size=100)."),
+  filter_properties: FILTER_PROPERTIES,
   verbose: VERBOSE,
+}).superRefine((params, ctx) => {
+  if (params.ranking !== "title_relevance") return;
+  if (!normalizeTitleSearch(params.query ?? "")) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["query"],
+      message: "ranking=title_relevance requires a non-empty title query.",
+    });
+  }
+  for (const field of ["sort_direction", "start_cursor", "paginate"] as const) {
+    // paginate:false asks for a single page, which is all this mode returns anyway.
+    const conflicts = field === "paginate" ? params.paginate === true : params[field] !== undefined;
+    if (conflicts) {
+      ctx.addIssue({
+        code: "custom",
+        path: [field],
+        message: `ranking=title_relevance cannot be combined with ${field}. Remove it or use ranking=notion.`,
+      });
+    }
+  }
 });
 
 register({
@@ -458,12 +683,14 @@ register({
   access: "read",
   domain: "pages",
   description:
-    "Search pages and databases by title. Title-only; does NOT search page body content. Each result carries `object` (page | database | data_source). Pass paginate:true to auto-walk all pages.",
+    "Search pages and databases by title. Title-only; does NOT search page body content. Each result carries `object` (page | database | data_source). Default ordering is Notion's native search order. Pass ranking:'title_relevance' to re-rank up to 100 candidates by normalized title relevance. Pass paginate:true to auto-walk all pages.",
   batchable: false,
   schema: SearchPagesParams,
   example: { query: "smoke test", page_size: 10 },
-  handler: tryHandler(async ({ query, sort_direction, page_size, start_cursor, paginate, page_limit, verbose }): Promise<OperationResult> => {
+  handler: tryHandler(async ({ query, sort_direction, ranking, page_size, start_cursor, paginate, page_limit, filter_properties, verbose }): Promise<OperationResult> => {
     const notion = await getClient();
+    // Ranking reads the title even when the raw page goes back to the caller.
+    const filter = filterPropertiesQuery(filter_properties, !verbose || ranking === "title_relevance");
     // Slim pages and databases look alike; the object kind says which id
     // goes where (a database id is not a valid create_page parent).
     const slimKind = (item: Parameters<typeof slimItem>[0], v?: boolean) => ({
@@ -474,6 +701,28 @@ register({
       ? { sort: { direction: sort_direction, timestamp: "last_edited_time" as const } }
       : {};
 
+    if (ranking === "title_relevance") {
+      const titleQuery = query!.trim(); // Validated by SearchPagesParams.
+      const requested = page_size ?? 10;
+      const response = await notion.search({ query: titleQuery, page_size: 100, ...filter });
+      // Rank raw results using a compact, consistently shaped title, then
+      // convert them to the caller's selected (slim or verbose) representation.
+      const ranked = rankTitleSearch(
+        response.results,
+        titleQuery,
+        (item) => (slimItem(item, false) as { title?: unknown }).title
+      );
+      return {
+        ok: true,
+        data: {
+          results: ranked.slice(0, requested).map((item) => slimKind(item, verbose ?? false)),
+          ranking: "title_relevance",
+          candidates_considered: response.results.length,
+          source_has_more: response.has_more,
+        },
+      };
+    }
+
     if (paginate) {
       const { results, truncated, pages_walked } = await paginateAll(
         async (cursor) => {
@@ -482,6 +731,7 @@ register({
             ...sort,
             page_size: page_size ?? 100,
             start_cursor: cursor,
+            ...filter,
           });
           return { results: r.results, has_more: r.has_more, next_cursor: r.next_cursor };
         },
@@ -502,6 +752,7 @@ register({
       ...sort,
       page_size: page_size ?? 10,
       start_cursor,
+      ...filter,
     });
     return { ok: true, data: slimList(response, slimKind, verbose ?? false) };
   }),
@@ -533,13 +784,103 @@ register({
   example: { page_id: "<page-id>" },
   handler: tryHandler(async ({ page_id, include_properties, verbose }) => {
     const notion = await getClient();
-    const response = await notion.pages.retrieve({ page_id });
-    return {
-      ok: true,
-      data: slimPage(response, verbose ?? false, include_properties ?? false),
-    };
+    let response = await notion.pages.retrieve({ page_id });
+    if (verbose) {
+      // The raw page is returned as Notion sent it, cut lists included.
+      const cut = incompleteListProperties(response);
+      return withWarnings(
+        { ok: true, data: response },
+        cut.length
+          ? [`The raw page object holds at most ${PAGE_PROPERTY_REFERENCE_LIMIT} values per relation or people property, and ${propertiesLabel(cut)} may hold more. Call get_page with include_properties:true and without verbose for the full list.`]
+          : []
+      );
+    }
+    let unread = new Map<string, string>();
+    if (include_properties && isFullPage(response)) {
+      ({ page: response, unread } = await withFullListProperties(notion, response));
+    }
+    const capped = include_properties ? incompleteListProperties(response).filter((n) => !unread.has(n)) : [];
+    const keepWhole = "Do not write such a list back with set_page_property: it replaces the whole list and would drop the rest.";
+    return withWarnings({ ok: true, data: slimPage(response, false, include_properties ?? false) }, [
+      ...(capped.length
+        ? [`The ${propertiesLabel(capped)} ${capped.length === 1 ? "holds" : "hold"} more than ${LIST_PROPERTY_VALUE_LIMIT} values, and only the first ${LIST_PROPERTY_VALUE_LIMIT} were read. ${keepWhole}`]
+        : []),
+      ...[...unread].map(
+        ([name, reason]) =>
+          `The full list of property "${name}" could not be read (${reason}), so it shows the ${PAGE_PROPERTY_REFERENCE_LIMIT} values the page object carries and may hold more. ${keepWhole}`
+      ),
+    ]);
   }),
 });
+
+const LIST_PROPERTY_PAGE_LIMIT = DEFAULT_PAGE_LIMIT;
+const LIST_PROPERTY_PAGE_SIZE = 100;
+const LIST_PROPERTY_VALUE_LIMIT = LIST_PROPERTY_PAGE_LIMIT * LIST_PROPERTY_PAGE_SIZE;
+
+// `property "A"` / `properties "A", "B"`
+function propertiesLabel(names: readonly string[]): string {
+  return `${names.length === 1 ? "property" : "properties"} ${names.map((n) => `"${n}"`).join(", ")}`;
+}
+
+/**
+ * Swap in the full value of every relation / people property the page object
+ * cut at 25, read through the property-item endpoint. set_page_property
+ * replaces a whole list, so a read-modify-write on the cut value would delete
+ * every reference past the 25th. A list longer than the walk cap keeps
+ * `has_more: true`, which slimPage reports in `truncated_properties`.
+ *
+ * Each property call is paced and retried on its own by the client
+ * (PacedClient in services/notion.ts). A property whose walk still fails
+ * keeps the page object's values, flagged as cut, and its reason goes in
+ * `unread`, so the page read still succeeds.
+ */
+async function withFullListProperties(
+  notion: Awaited<ReturnType<typeof getClient>>,
+  page: PageObjectResponse
+): Promise<{ page: PageObjectResponse; unread: Map<string, string> }> {
+  const properties = { ...page.properties };
+  const unread = new Map<string, string>();
+  for (const [name, prop] of Object.entries(page.properties)) {
+    if (!isIncompleteListProperty(prop)) continue;
+    // The SDK types leave has_more off the page value; Notion sends it on a relation.
+    let full: Record<string, unknown>;
+    try {
+      const { values, truncated } = await walkListProperty(notion, page.id, prop.id);
+      full = { ...prop, [prop.type]: values, has_more: truncated };
+    } catch (error) {
+      const { code, message } = toErrorEnvelope(error);
+      unread.set(name, `${code}: ${message}`);
+      full = { ...prop, has_more: true };
+    }
+    properties[name] = full as unknown as typeof prop;
+  }
+  return { page: { ...page, properties }, unread };
+}
+
+async function walkListProperty(
+  notion: Awaited<ReturnType<typeof getClient>>,
+  pageId: string,
+  propertyId: string
+): Promise<{ values: unknown[]; truncated: boolean }> {
+  const { results, truncated } = await paginateAll(
+    async (cursor) => {
+      const r = await notion.pages.properties.retrieve({
+        page_id: pageId,
+        property_id: propertyId,
+        page_size: LIST_PROPERTY_PAGE_SIZE,
+        ...(cursor ? { start_cursor: cursor } : {}),
+      });
+      return r.object === "list"
+        ? { results: r.results, has_more: r.has_more, next_cursor: r.next_cursor }
+        : { results: [r], has_more: false, next_cursor: null };
+    },
+    { limit: LIST_PROPERTY_PAGE_LIMIT }
+  );
+  const values = results.flatMap((item) =>
+    item.type === "relation" ? [item.relation] : item.type === "people" ? [item.people] : []
+  );
+  return { values, truncated };
+}
 
 // ──────────────────────────────────────────────────────────────────────────
 // move_page
@@ -598,18 +939,53 @@ const GetPageMarkdownParams = z.object({
   page_id: notionId(),
 });
 
+/**
+ * Notion stops rendering at about 20,000 blocks and renders blocks the
+ * integration can't read as `<unknown>` tags. Either way the markdown is not
+ * the whole page, and writing it back with replace_content would delete what
+ * was left out.
+ */
+function incompleteMarkdownWarning(
+  truncated: boolean,
+  unknownBlockIds: readonly string[]
+): string | undefined {
+  if (!truncated && unknownBlockIds.length === 0) return undefined;
+  const why = [
+    truncated ? "Notion truncated it (pages over about 20,000 blocks)" : undefined,
+    unknownBlockIds.length
+      ? `${unknownBlockIds.length} block(s) could not be loaded and appear as <unknown> tags (not shared with the integration, or past the limit); see unknown_block_ids`
+      : undefined,
+  ].filter(Boolean);
+  return `This markdown is not the whole page: ${why.join("; ")}. Do not replace the whole page with update_page_markdown (replace_content): blocks missing here would be deleted. Edit with insert_content, append_blocks or update_block instead, or pass an unknown block id as page_id to read that block.`;
+}
+
 register({
   name: "get_page_markdown",
   access: "read",
   domain: "pages",
-  description: "Return a page's body as Notion-rendered markdown. Server-side conversion; round-trips with update_page_markdown.",
+  description:
+    "Return a page's body as Notion-rendered markdown. Server-side conversion; round-trips with update_page_markdown. `truncated: true` or a non-empty `unknown_block_ids` means part of the page is missing from the markdown.",
   batchable: true,
   schema: GetPageMarkdownParams,
   example: { page_id: "<page-id>" },
   handler: tryHandler(async ({ page_id }) => {
     const notion = await getClient();
     const response = await notion.pages.retrieveMarkdown({ page_id });
-    return { ok: true, data: { page_id, markdown: response.markdown ?? "" } };
+    const truncated = response.truncated ?? false;
+    const unknownBlockIds = response.unknown_block_ids ?? [];
+    const warning = incompleteMarkdownWarning(truncated, unknownBlockIds);
+    return withWarnings(
+      {
+        ok: true,
+        data: {
+          page_id,
+          markdown: response.markdown ?? "",
+          truncated,
+          unknown_block_ids: unknownBlockIds,
+        },
+      },
+      warning ? [warning] : []
+    );
   }),
 });
 
@@ -636,7 +1012,8 @@ register({
   name: "update_page_markdown",
   access: "write",
   domain: "pages",
-  description: "Replace (or insert into) a page's body using Notion's server-side markdown renderer. Skip the local remark pipeline.",
+  description:
+    "Replace (or insert into) a page's body using Notion's server-side markdown renderer. Skip the local remark pipeline. Replacing deletes every block the new markdown leaves out: if get_page_markdown returned `truncated: true` or any `unknown_block_ids`, do not replace the page — use insert_content or block operations.",
   batchable: true,
   schema: UpdatePageMarkdownParams,
   example: {

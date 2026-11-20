@@ -18,17 +18,18 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "24" # ships with npm >= 11.5 (required for Trusted Publishing)
           registry-url: "https://registry.npmjs.org"
 
-      - name: Ensure npm is current
+      - name: Pin npm
         # Kept (unlike in ci.yml) because publishing has its own reason to be on
-        # a current npm: Trusted Publishing / OIDC provenance. node-version 24 is
-        # already meant to satisfy that floor; this guarantees it. A broken
-        # release costs far more than the 15s.
-        run: npm install -g npm@latest
+        # a known npm: Trusted Publishing / OIDC provenance needs >= 11.5.
+        # Pinned rather than @latest: the step that holds the publish token
+        # should not run whatever npm release landed minutes ago. Bump it by
+        # hand, to a release at least a week old.
+        run: npm install -g npm@11.21.0
 
       - name: Install dependencies
         # `npm ci` (not `npm install`): the published tarball must be built and
@@ -75,19 +76,32 @@ jobs:
           fi
 
       - name: Sync server.json version with package.json
+        # The registry rejects a `version` field on an OCI package, so the
+        # Docker image carries its version as the tag in `identifier`.
         run: |
           node -e "
             const fs = require('fs');
             const { version } = require('./package.json');
             const s = JSON.parse(fs.readFileSync('server.json', 'utf8'));
             s.version = version;
-            for (const p of s.packages) p.version = version;
+            for (const p of s.packages) {
+              if (p.registryType === 'oci') p.identifier = p.identifier.replace(/:[^:/]+$/, ':' + version);
+              else p.version = version;
+            }
             fs.writeFileSync('server.json', JSON.stringify(s, null, 2) + '\n');
           "
 
       - name: Install mcp-publisher
+        # Pinned to a release and checked against its sha256 (from that
+        # release's registry_<version>_checksums.txt) before it runs with this
+        # job's OIDC token. To bump: change both values together.
+        env:
+          MCP_PUBLISHER_VERSION: v1.8.1
+          MCP_PUBLISHER_SHA256: a06c9096dcb9727c13555b6be26c7effa707b01f06a4c561ba7a3635443cf2cc
         run: |
-          curl -fsSL "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_linux_amd64.tar.gz" | tar xz mcp-publisher
+          curl -fsSL -o mcp-publisher.tar.gz "https://github.com/modelcontextprotocol/registry/releases/download/${MCP_PUBLISHER_VERSION}/mcp-publisher_linux_amd64.tar.gz"
+          echo "${MCP_PUBLISHER_SHA256}  mcp-publisher.tar.gz" | sha256sum -c -
+          tar xzf mcp-publisher.tar.gz mcp-publisher
 
       - name: Wait for npm to serve the published version
         # npm's publish pipeline is asynchronous: `npm publish` returns "your
@@ -109,6 +123,25 @@ jobs:
             sleep 30
           done
           echo "::error::npm did not serve $NAME@$VERSION within 20 minutes."
+          exit 1
+
+      - name: Wait for GHCR to serve the Docker image
+        # server.json also lists the Docker image, which publish-docker.yml
+        # builds from the same tag in parallel with this run. The registry
+        # checks that the image tag exists and carries the
+        # io.modelcontextprotocol.server.name label, so registering before that
+        # push finishes fails.
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          IMAGE="ghcr.io/awkoy/notion-mcp-server:$VERSION"
+          for i in $(seq 1 40); do
+            if docker manifest inspect "$IMAGE" >/dev/null 2>&1; then
+              echo "GHCR serves $IMAGE (after $(( (i - 1) * 30 ))s)."
+              exit 0
+            fi
+            sleep 30
+          done
+          echo "::error::GHCR did not serve $IMAGE within 20 minutes."
           exit 1
 
       - name: Publish to MCP Registry
