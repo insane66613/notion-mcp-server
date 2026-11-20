@@ -16,6 +16,7 @@ export type OperationName =
   | "append_blocks"
   | "get_block"
   | "get_block_children"
+  | "query_meeting_notes"
   | "update_block"
   | "delete_block"
   | "batch_mixed_blocks"
@@ -45,6 +46,7 @@ export type OperationName =
   | "get_bot_user"
   | "get_self"
   | "upload_file"
+  | "upload_to_property"
   | "list_file_uploads"
   | "get_file_upload"
   | "get_file_url"
@@ -77,11 +79,19 @@ export type BatchItemResult<T = unknown> =
   | { index: number; ok: true; data: T; warnings?: string[] }
   | { index: number; ok: false; error: OperationError };
 
+export type IdempotencyReceipt = {
+  decision: "accepted" | "deduplicated";
+  /** Present on a deduplicated retry; points back to the original accepted attempt. */
+  replay_of?: "original";
+};
+
 export type BatchResult<T = unknown> = {
   ok: boolean;
   summary: { total: number; succeeded: number; failed: number };
   results: BatchItemResult<T>[];
   rolled_back?: number;
+  /** Additive metadata for a keyed batch; omitted for unkeyed batches. */
+  idempotency_receipt?: IdempotencyReceipt;
   /** Non-fatal notes about the envelope, e.g. an unknown top-level field that was ignored. */
   warnings?: string[];
 };
@@ -106,6 +116,15 @@ export type OperationDef<TParams = unknown, TResult = unknown> = {
   domain: OperationDomain;
   /** Removes or hides content (trash/archive/delete). Defaults to false. */
   destructive?: boolean;
+  /**
+   * For an operation only some calls of which remove content: given one
+   * parsed item, a sentence saying what it would remove, or null when it
+   * removes nothing. Such a call is confirmed under NOTION_CONFIRM_DESTRUCTIVE
+   * like a `destructive` operation. The operation stays out of the
+   * `destructive` access group, which names whole operations, so its handler
+   * refuses just the removing calls when that group is blocked.
+   */
+  destructiveWhen?: (item: Record<string, unknown>) => string | null;
   example: unknown;
   exampleBatch?: unknown;
   rollback?: RollbackFn;

@@ -5,6 +5,136 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.5.0] - 2026-11-19
+
+### Added
+
+- **`upload_to_property`.** Uploads one or more files and puts them into a page's files property in the same call, from the same `base64`, `url` and `path` sources as `upload_file`, under the same guards. It appends to the files the property already holds; `replace: true` overwrites the list, counts as destructive (refused while `destructive` is blocked, confirmed under `NOTION_CONFIRM_DESTRUCTIVE`). `sources` carries several files in one request, and batch items that reach the same page and property run one at a time, so none of them drops another's file. A property name the page doesn't have, or one that isn't a files property, is refused before anything is uploaded. Contributed by @ggggggggggz in #136.
+
+### Changed
+
+- Dependencies: the lockfile now pins `hono` 4.13.18 (was 4.13.12), so the Docker image and the `.mcpb` bundle ship it. npm installs resolve their own dependency tree and are unchanged. No code changes.
+
+## [3.4.0] - 2026-11-09
+
+### Added
+
+- **Silent page writes.** `create_page`, `set_page_title`, `set_page_property`, `set_page_properties`, `archive_page`, `trash_page` and `restore_page` take an optional `notifications: { mode: "silent" | "default" }`. `silent` skips page update, @mention and Person property notifications for that change; database automations, reminders and connection webhooks still run. `update_page_markdown` and `move_page` don't have it, because Notion's endpoints behind them don't accept the parameter.
+- **`filter_properties` on `search_pages` and page writes.** `search_pages`, `create_page`, `set_page_title`, `set_page_property`, `set_page_properties`, `archive_page`, `trash_page` and `restore_page` take a list of property names or ids, and Notion returns only those properties. It shortens `verbose: true` responses: about 80% on a 24-property row, measured live. The default response carries no properties, so its size does not change. See [docs/operations.md](docs/operations.md#fewer-properties-in-a-response).
+- **Typed databases in `create_database`.** `database_type` (`tasks`, `projects` or `skills`) builds the database from Notion's canonical schema for that type, so `properties` and `title` become optional; without a title the database is named after its type. Passing it together with `properties` fails validation before any request, with a `fix` that says which field to remove. `create_database`, `get_data_source` and the other database and data source results return a type Notion reports as `database_type`.
+- **`query_meeting_notes`.** Reads AI meeting notes through Notion's `POST /v1/blocks/meeting_notes/query`, with an optional `filter`, `sort` and `limit` (up to 50). A note comes back slimmed to its id, title, status, times, calendar and recording details and the ids of its summary, notes and transcript blocks; `verbose: true` returns Notion's block objects. The endpoint has no cursor, so when more notes match, `has_more` comes with a warning to narrow the filter. It needs a plan with AI meeting notes and returns only notes the token's user attends.
+
+### Changed
+
+- **`create_database` rejects `initial_data_source`.** It was never a field of this operation, and a call that sent it next to `properties` only got a warning. It now fails validation, and the `fix` points at `properties`.
+- Dependencies: the lockfile now pins `@hono/node-server` 2.1.6 (was 1.19.17), so the Docker image and the `.mcpb` bundle ship it. This closes GHSA-rmxm-3fg6-px4f there; npm installs resolve their own dependency tree and already get 2.x.
+
+## [3.3.1] - 2026-11-05
+
+### Changed
+
+- Dependencies: `@modelcontextprotocol/server` 2.4.0 (was 2.3.1) and `@modelcontextprotocol/node` 2.1.2 (was 2.1.1). Dev-only: `@modelcontextprotocol/client` 2.4.0, `@types/node` 26.6.6.
+
+### Fixed
+
+- **A fresh install starts on Node 22 again.** `@notionhq/client` was declared as `^5.22.0`, so a new install got the latest client, and from 5.30.0 its CommonJS build no longer exposes `Client` as a named export Node 22 can detect. The server stopped at startup with `SyntaxError: Named export 'Client' not found`; Node 24 was unaffected. The client is now pinned to 5.29.0 (was 5.27.1 in the lockfile), the newest version Node 22 can load. ([#135](https://github.com/awkoy/notion-mcp-server/issues/135))
+
+## [3.3.0] - 2026-10-25
+
+### Added
+
+- **The Docker image in the MCP registry.** `server.json` lists `ghcr.io/awkoy/notion-mcp-server` as an OCI package next to the npm package, so registry clients can run the server with Docker. The image tag carries the version, and the release workflow waits for GHCR to serve that tag before it registers the release.
+- **Tools listed in the `.mcpb` bundle.** The manifest names `notion_read`, `notion_write` and `notion_describe`, so Claude Desktop can list them on the extension page.
+- **Status properties in `create_database` and `update_data_source`.** A definition takes `status: {}` for Notion's default options, or `options` with a `name`, `color`, `description` and `group` (`To-do`, `In progress` or `Complete`). On `update_data_source` an option can be named by its `id` alone, to recolor it or move it to another group (Notion keeps an option's name, so the API can't rename one), and the list replaces the property's options, so an option left out is removed. The schema was in the code but not in the list of property types, so a status definition failed validation.
+- **Deleting a property counts as destructive.** An `update_data_source` call that sets a property to `null` deletes that column and its values on every page, and the API can't bring it back. Under `NOTION_CONFIRM_DESTRUCTIVE` that call now asks first, and the dialog names the properties. With `destructive` in `NOTION_BLOCKED_OPERATIONS` it's refused with `operation_not_allowed`. Other schema changes still run without either.
+- `MCP_ALLOW_UNAUTHENTICATED`, for an HTTP deployment that authenticates in a proxy in front of the server. See the HTTP change below.
+- **`upload_file` knows more file types.** `html`/`htm`, and CAD and 3D formats (`dwg`, `dxf`, `step`/`stp`, `stl`, `obj`, `glb`, `gltf`), get their MIME type from the extension. CAD and 3D files attach as file blocks.
+- **Upload limits are configurable:** `NOTION_UPLOAD_MAX_BYTES` (default 1 GiB), `NOTION_UPLOAD_URL_TIMEOUT_MS` (default 30000) and `NOTION_UPLOAD_ALLOW_PRIVATE_URLS`. See [docs/configuration.md](docs/configuration.md#uploads).
+
+### Changed
+
+- **Writes are no longer retried after a 5xx.** A 500, 503 or 504 can come back after Notion saved the write, so retrying created duplicate blocks, rows and comments. A write request (POST, PATCH, DELETE) is now retried only on 429 (`rate_limited`) and 529 (`service_overload`), where Notion did not run it. GETs, and every request of a read operation (search and data source queries are POSTs), still retry on 5xx, and now on timeouts too. The fix text on 500, 503 and 504 errors now tells the model to read the target back before repeating a write.
+- **One retry layer, per request.** The SDK client retries each HTTP request on its own, with the SDK's built-in retries off, and dispatch runs a handler once. Before, the SDK retried up to twice under each of dispatch's five attempts, so a failing GET could send 15 requests, and it retried a DELETE on a 500. A 429 halfway through `batch_mixed_blocks` or `upload_file` now resends that one request instead of failing or repeating the whole call.
+- **A write that fails after part of it was applied says so.** The error message adds that part of the call was already applied in Notion, and the fix tells the model to read the target back and repeat only what is missing.
+- **`NOTION_RATE_LIMIT` paces every request.** The limiter took one token per handler call, so operations that send several requests (`batch_mixed_blocks`, multi-part uploads, markdown page reads) could exceed it. Every Notion HTTP request now takes a token, retries included.
+- **Breaking for one HTTP setup: a non-loopback `HOST` needs `MCP_AUTH_TOKEN`.** Bound to `0.0.0.0` or a LAN address without a token, anyone who could reach the port acted with your `NOTION_TOKEN`; the server only printed a warning. It now refuses to start. Set `MCP_AUTH_TOKEN`, bind `HOST=127.0.0.1`, or set `MCP_ALLOW_UNAUTHENTICATED=true` when an authenticating proxy sits in front. Loopback binds and stdio are unchanged.
+- **Idle HTTP sessions close.** 2025-era clients open a session per connection, and a client that went away without `DELETE` left its session in memory for the life of the process. A session with no request and no open stream for 30 minutes is now closed, and at 1,000 open sessions the longest-idle one makes room, or a new client gets `503` when every session is busy. 2026-07-28 clients are stateless and unaffected.
+- **Node.js 22 or later.** Node 20 left support in April 2026. `engines`, the `.mcpb` manifest and the plugin README say 22, and CI runs on 22 and 24.
+- Dependencies: `@modelcontextprotocol/server` 2.3.1 (was 2.2.0) and `@modelcontextprotocol/node` 2.1.1 (was 2.1.0). The lockfile also pins `@notionhq/client` 5.27.1 (was 5.27.0) and `zod` 4.6.7 (was 4.6.5), so the Docker image and the `.mcpb` bundle ship them. Dev-only: `@modelcontextprotocol/client` 2.3.1, `vitest` 5.0.5.
+- The Gemini CLI extension runs `notion-mcp-server@3.2.1`, pinned like the plugins, instead of whatever npm serves as latest.
+- The auth error's fix no longer mentions an OAuth gateway the server doesn't have.
+- **An idempotency key is bound to its batch** ([#109](https://github.com/awkoy/notion-mcp-server/pull/109), thanks @insane66613). The key used to cache by operation and key alone, so a different batch sent under a reused key got the first batch's result back and never ran. Now the key is bound to the operation, the items and `atomic` (not `concurrency`) for 5 minutes.
+  - An exact retry gets the cached result, with `idempotency_receipt: { decision: "deduplicated" }`. The first call's result carries `{ decision: "accepted" }`.
+  - Anything else under the same key fails with `idempotency_conflict`, including the same items sent to another operation: keys are now global, not per operation.
+  - A retry that arrives while the first call is still running fails with `idempotency_in_progress` instead of running a second copy.
+  - An empty or non-string key fails with `invalid_idempotency_key`; `null` still means no key.
+  - A batch in which no item passed validation is not cached, so the corrected batch can reuse the key.
+- **`upload_file` sends an unknown extension as `application/octet-stream`** instead of refusing the file. Notion has resolved the type from the file name since 2026-09-22, so the old error message, which said Notion rejects octet-stream, was wrong. A file name with no extension still needs `content_type`.
+- **`upload_file` picks `mode` from the size when it is omitted:** single-part up to 20 MiB, multi-part above. Before, an omitted `mode` meant single-part, and a large file failed at Notion. An explicit `mode: "single"` over 20 MiB is now refused before anything is sent.
+
+### Fixed
+
+- **Long or deeply nested content in `create_page`, `append_blocks` and `batch_mixed_blocks`.** Notion takes at most 100 blocks in a children array, 1000 blocks per request and two levels of nesting, and the server sent all of a call's content in one request, so markdown with more than 100 top-level blocks, a list nested three deep or a table of more than 100 rows failed. The content now goes in as many requests as those limits need, in order. If a later request fails, `create_page` moves the half-written page to trash, and `append_blocks` says how many blocks it appended and the id of the last one.
+- **`get_page_markdown` says when the page is incomplete.** It returns Notion's `truncated` and `unknown_block_ids`, and warns against replacing such a page with `update_page_markdown`, which would delete the blocks missing from the markdown. The `notion://page` resource starts such a page with an HTML comment.
+- **Relation and people values past 25.** `get_page` with `include_properties: true` reads the whole list (up to 1,000 values) instead of the 25 a page object holds. Each of those reads takes its own rate-limit slot; if Notion refuses one, the property keeps the 25 values, is named in `truncated_properties` and gets a warning with Notion's error. `query_database` and `query_view` rows name cut properties in `truncated_properties` and add a warning, rather than an extra call per row.
+- **`prompts/get` without an `arguments` object.** `weekly_review` and `daily_log` take no required arguments, and clients such as the MCP Inspector leave the object out. SDK 2.2.0 rejected that call with "expected object, received undefined"; 2.3.1 accepts it.
+- The Docker image ships `LICENSE`.
+- `--help` links to the README's configuration and HTTP sections again; the anchors had moved in the README rewrite.
+- **`Retry-After` is honoured.** The reader never found the header on the SDK's responses (node-fetch's `Headers` is not the global class), so every retry used plain backoff. It now reads the header or, failing that, `additional_data.retry_after` in the error body, and waits the time Notion asked for even past the 8 s backoff cap. Only whole or decimal seconds and HTTP dates count; anything else falls back to backoff. A request stops retrying 60 s after its first try, and one call's retries wait at most 60 s in total, so a long wait returns the error instead of holding the call. The value never appears in the error the model sees.
+- **Operation count.** The README, the docs, the `.mcpb` description and the Docker catalog copy said 47 operations. There are 46, plus two aliases: `trash_page` for `archive_page` and `get_self` for `get_bot_user`. The README's operations menu now marks `get_self` as an alias, and its heading is "46 ops, plus two aliases".
+- The plugin README explains why the server fails to start for a few days after an update when npm's `min-release-age` or `before` setting is on, and how to exempt this package on npm 12.
+
+### Security
+
+- Release workflows: the Docker and `.mcpb` jobs run the test suite before they publish, as the npm job already did. A manual run of the Docker workflow from `main` no longer pushes `latest`. The npm job installs a pinned npm instead of `npm@latest`, and `mcp-publisher` is pinned to a release and checked against its sha256 before it runs with the job's OIDC token.
+- CI builds the Docker image on every pull request (nothing is pushed) and checks that it starts.
+
+`upload_file` reads the sources a model hands it, so a prompt injection in a page could steer it at the server's own files or network. Both sources are now guarded. **⚠️ Possibly breaking:** calls that used to work can now be refused; each item below says how to get the old behaviour back.
+
+- **Local paths over HTTP need `NOTION_UPLOAD_ROOT`.** With `MCP_TRANSPORT=http` and no root, a `path` source is refused with `path_not_allowed`: the caller is remote and could otherwise read any file the server can. Base64 and URL sources still work. Set `NOTION_UPLOAD_ROOT` to the directory uploads come from, or `/` to allow any path.
+- **Over stdio without a root, dot-named paths and system and app-data folders are refused.** A path whose real location, after symlinks, goes through a dot-named file or directory (`~/.ssh`, `~/.aws`, `.env`, `.git`, `~/.config`) gets `path_not_allowed`. So does one under `/proc`, `/sys`, `/dev`, `/run/secrets` or `/var/run/secrets`; macOS `~/Library`, except iCloud Drive (`~/Library/Mobile Documents`) and `~/Library/CloudStorage`; Windows `~\AppData`, `%APPDATA%` and `%LOCALAPPDATA%`; and `XDG_CONFIG_HOME`, `XDG_DATA_HOME` and `XDG_STATE_HOME` when they are set. MCP clients keep their config there, this server's `NOTION_TOKEN` included (`~/Library/Application Support/Claude/claude_desktop_config.json`, `%APPDATA%\Claude\claude_desktop_config.json`), and `/proc/self/environ` holds the server's own environment. This is a heuristic that catches the usual credential stores, not a sandbox, and it also catches legitimate files under, say, `~/.local`, a `.claude/worktrees` checkout or an app's folder in `~/Library`. `NOTION_UPLOAD_ROOT` lifts it (dot names are allowed inside a root), and `NOTION_UPLOAD_ROOT=/` restores the old behaviour.
+- **A path must be a regular file within the size limit.** The file is stat'ed before it is read and opened non-blocking, so a directory, `/dev/zero` or a FIFO is refused instead of hanging the server or filling its memory. It is opened with `O_NOFOLLOW` where the platform has it, and the open handle must be the same file (device and inode) that was checked, so a file or symlink swapped in between the check and the open is refused. A dangling symlink on the way to the file is reported as missing instead of being passed over, so a target created later can't be read through it.
+- **URL sources can't reach private addresses.** Only `http` and `https`. Every address the host resolves to must be public: loopback, RFC 1918, carrier-grade NAT, link-local (cloud metadata included), multicast, reserved ranges and IPv6 forms carrying any of those are refused with `url_refused`. Without a proxy the connection is pinned to the checked addresses, so a DNS answer can't change between the check and the request. Redirects are followed by hand, at most five, and each hop is checked again. Set `NOTION_UPLOAD_ALLOW_PRIVATE_URLS=true` for an intranet host.
+- **Behind a proxy, the server has to resolve names itself.** The private-address check runs on the server's own DNS answer, even when `HTTPS_PROXY` makes the connection. Where only the proxy can resolve names (a network whose only way out is the proxy), every URL upload now fails with `fetch_failed`. `NOTION_UPLOAD_ALLOW_PRIVATE_URLS=true` skips the check and the lookup with it.
+- **URL fetches have a timeout and a size cap.** One `NOTION_UPLOAD_URL_TIMEOUT_MS` budget (30 s) covers DNS, the redirects and the body; the body is streamed and the fetch stops once it passes `NOTION_UPLOAD_MAX_BYTES`. Before, a slow or endless response could hold the call open forever and fill memory.
+- **All sources share the size cap.** `NOTION_UPLOAD_MAX_BYTES` (1 GiB by default) applies to base64, path and URL sources alike, checked before the bytes are read where the size is known up front.
+- **Refusals have their own error codes.** `path_not_allowed`, `url_refused`, `too_large`, `timeout` and `fetch_failed`, each with a `fix`, where a refused path or a failed fetch used to come back as `internal_error`. A path that can't be read (missing, not permitted, a symlink loop) is now a `validation_error` with a fix, too.
+
+## [3.2.1] - 2026-10-19
+
+### Added
+
+- **Claude Code plugin** ([#118](https://github.com/awkoy/notion-mcp-server/pull/118)). Install it with `/plugin marketplace add awkoy/notion-mcp-server` and `/plugin install notion-mcp-server@awkoy`. The plugin runs `npx -y notion-mcp-server` pinned to its own version, asks for the token when you install it and keeps it in the system keychain, and also offers a default parent page and a read-only switch. It bundles a `notion-workflow` skill that teaches Claude to find things with `search_pages`, filter databases with `where`, batch repeated writes into one call, and ask before archiving or deleting anything.
+- **The same plugin for Codex and Cursor** ([#120](https://github.com/awkoy/notion-mcp-server/pull/120)). Codex installs it with `codex plugin marketplace add awkoy/notion-mcp-server` and `codex plugin add notion-mcp-server@awkoy`, and reads `NOTION_TOKEN` from the environment it starts in. Cursor installs it as a local plugin for now and takes `NOTION_TOKEN` from its plugin settings or its environment. The [plugin README](plugins/notion-mcp-server/README.md) has the steps.
+
+### Changed
+
+- **README rewritten** ([#117](https://github.com/awkoy/notion-mcp-server/pull/117)) at half its old length. Configuration, the HTTP transport, what calls look like on the wire, the comparison with Notion's own servers, and the development notes moved to [docs/](docs/). This release puts the new README on npm.
+- Package metadata: the npm description and keywords name the clients the server works with (Claude Code, Claude Desktop, Cursor, VS Code, Codex, Gemini CLI). The `.mcpb` bundle's description lists the three current tools, and its privacy link points at the README's renamed privacy section.
+- No changes to the server's code.
+
+## [3.2.0] - 2026-10-18
+
+### Added
+
+- **`ranking: "title_relevance"` on `search_pages`** ([#111](https://github.com/awkoy/notion-mcp-server/pull/111), [#115](https://github.com/awkoy/notion-mcp-server/pull/115); thanks @insane66613). Notion's `/v1/search` matches titles, but it can rank broad word matches ahead of the page whose title is the query. This mode fetches up to 100 candidates and re-ranks them by title. An exact title comes first, then titles that contain the query as a phrase (earlier, and at the very start, ranks higher), then titles by how many query words they contain. Notion's order breaks ties. Matching ignores case, punctuation and accents, so `cafe` finds `Café`. When folding accents makes two titles tie, the one that also matches with its marks kept wins, so for `Мой` the page `Мой` ranks above `Мои`. The result holds the top `page_size` matches (default 10) plus `candidates_considered` and `source_has_more`. The mode needs a non-empty `query`, and `sort_direction`, `start_cursor` or `paginate: true` alongside it come back as a `validation_error`. Without `ranking`, or with `ranking: "notion"`, results keep Notion's order, so existing calls are unchanged.
+
+### Changed
+
+- Dependencies: `@modelcontextprotocol/server` 2.2.0 (was 2.0.0) and `@modelcontextprotocol/node` 2.1.0 (was 2.0.0). The lockfile also pins `@notionhq/client` 5.27.0 (was 5.26.0), so the Docker image and the `.mcpb` bundle ship it. Dev-only bumps (`@modelcontextprotocol/client` 2.2.0, `source-map-js` 1.2.2) close three high-severity Dependabot alerts. Neither package ships.
+
+## [3.1.2] - 2026-10-04
+
+### Changed
+
+- Dependencies: the lockfile now pins `hono` 4.13.12 (was 4.13.5), so the Docker image and the `.mcpb` bundle ship it. The server doesn't use `serveStatic`, so the GHSA-5r4p-p66f-jhc7 fix in 4.13.11 doesn't affect it. npm installs resolve their own dependency tree and are unchanged. No code changes.
+
+## [3.1.1] - 2026-10-01
+
+### Changed
+
+- Package metadata: `author` now includes the author's website. README links to the post on the server's tool design. No code changes.
+
 ## [3.1.0] — 2026-09-16
 
 ### Added
@@ -151,7 +281,7 @@ Distribution release — no runtime changes to the server itself.
 
 ### Added
 
-- **Database views.** Six new operations for Notion database views (GitHub #18): `list_views`, `get_view`, `query_view`, `create_view`, `update_view`, `delete_view`. `query_view` runs a view's stored filters/sorts and returns hydrated rows by default (set `hydrate: false` for ordered ids only), surfacing `total_count` and `truncated`; it hides Notion's create-then-paginate query mechanics. `list_views` hydrates Notion's id-only refs to `{id, name, type}` by default. `create_view` / `update_view` reuse the `where` filter shorthand and accept a raw `configuration` for type-specific layout (calendar/board/timeline/chart/map require it; a missing config is rejected locally with a fix rather than a raw API 400). `delete_view` is destructive and honors `NOTION_READ_ONLY` / the allow/block lists. See [README → Operations menu](./README.md#operations-menu-47-ops-plus-one-alias).
+- **Database views.** Six new operations for Notion database views (GitHub #18): `list_views`, `get_view`, `query_view`, `create_view`, `update_view`, `delete_view`. `query_view` runs a view's stored filters/sorts and returns hydrated rows by default (set `hydrate: false` for ordered ids only), surfacing `total_count` and `truncated`; it hides Notion's create-then-paginate query mechanics. `list_views` hydrates Notion's id-only refs to `{id, name, type}` by default. `create_view` / `update_view` reuse the `where` filter shorthand and accept a raw `configuration` for type-specific layout (calendar/board/timeline/chart/map require it; a missing config is rejected locally with a fix rather than a raw API 400). `delete_view` is destructive and honors `NOTION_READ_ONLY` / the allow/block lists. See [README → Operations menu](./README.md#operations-menu-47-ops-plus-two-aliases).
 
 ### Changed
 
