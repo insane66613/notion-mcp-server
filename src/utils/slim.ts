@@ -449,6 +449,7 @@ export function slimView(view: unknown, verbose = false) {
     name?: string;
     type?: string;
     filter?: unknown;
+    quick_filters?: unknown;
     sorts?: unknown;
     dashboard_view_id?: string;
     configuration?: { type?: string; rows?: Array<{ widgets?: unknown[] }> };
@@ -467,6 +468,7 @@ export function slimView(view: unknown, verbose = false) {
         }
       : {}),
     ...(v.filter ? { filter: v.filter } : {}),
+    ...(v.quick_filters !== undefined ? { quick_filters: v.quick_filters } : {}),
     ...(Array.isArray(v.sorts) && v.sorts.length ? { sorts: v.sorts } : {}),
   };
 }

@@ -344,6 +344,43 @@ describe("create_view", () => {
     expect(call).toHaveProperty("filter");
   });
 
+  it("creates saved quick filters independently of the advanced filter", async () => {
+    notionStub.dataSources.retrieve.mockResolvedValue({
+      object: "data_source", id: "ds-1",
+      parent: { type: "database_id", database_id: "db-parent" },
+    });
+    notionStub.views.create.mockImplementation(async (args) => {
+      calls.push({ method: "views.create", args });
+      return { id: "v-quick", name: "Priority", type: "table",
+        quick_filters: args.quick_filters };
+    });
+    const res = await dispatch("create_view", {
+      data_source_id: "ds-1", name: "Priority", type: "table",
+      quick_filters: { Status: { status: { equals: "In progress" } } },
+    });
+    expect(res).toMatchObject({ ok: true, data: {
+      quick_filters: { Status: { status: { equals: "In progress" } } },
+    } });
+    expect(calls[0].args).toMatchObject({
+      quick_filters: { Status: { status: { equals: "In progress" } } },
+    });
+    expect(calls[0].args).not.toHaveProperty("filter");
+  });
+
+  it("rejects invalid quick filters before any network call", async () => {
+    for (const quick_filters of [
+      { Status: {} }, { Status: { property: "Status", status: { equals: "Done" } } },
+      { Status: { and: [{ status: { equals: "Done" } }] } },
+      { Status: "Done" },
+    ]) {
+      const res = await dispatch("create_view", {
+        data_source_id: "ds-1", name: "Bad", type: "table", quick_filters,
+      });
+      expect(res).toMatchObject({ ok: false });
+    }
+    expect(notionStub.views.create).not.toHaveBeenCalled();
+  });
+
   it("rejects a calendar view without required configuration", async () => {
     const res = (await dispatch("create_view", {
       data_source_id: "ds-1",
@@ -404,6 +441,35 @@ describe("update_view", () => {
     const call = calls[0].args as Record<string, unknown>;
     expect(call).toMatchObject({ view_id: "v-1", name: "Renamed" });
     expect(call).toHaveProperty("filter");
+  });
+
+  it("updates and explicitly clears pinned quick filters", async () => {
+    notionStub.views.update.mockImplementation(async (args) => {
+      calls.push({ method: "views.update", args });
+      return { id: "v-1", type: "table", quick_filters: args.quick_filters };
+    });
+    const changed = await dispatch("update_view", {
+      view_id: "v-1", quick_filters: { Status: { status: { equals: "Done" } } },
+    });
+    expect(changed).toMatchObject({ ok: true });
+    expect(calls[0].args).toMatchObject({
+      view_id: "v-1", quick_filters: { Status: { status: { equals: "Done" } } },
+    });
+    const cleared = await dispatch("update_view", {
+      view_id: "v-1", clear: ["quick_filters"],
+    });
+    expect(cleared).toMatchObject({ ok: true });
+    expect(calls[1].args).toMatchObject({ view_id: "v-1", quick_filters: null });
+  });
+
+  it("rejects simultaneous clear and replacement of quick filters", async () => {
+    const res = await dispatch("update_view", {
+      view_id: "v-1",
+      quick_filters: { Status: { status: { equals: "Done" } } },
+      clear: ["quick_filters"],
+    });
+    expect(res).toMatchObject({ ok: false, error: { code: "quick_filter_conflict" } });
+    expect(notionStub.views.update).not.toHaveBeenCalled();
   });
 
   it("clears filter when clear includes 'filter'", async () => {

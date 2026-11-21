@@ -124,6 +124,22 @@ async function resolveViewTarget(
   return { data_source_id: sources[0].id, database_id };
 }
 
+// Saved quick filters are keyed by data-source property name or ID.
+// Their values are property-filter conditions without a nested "property"
+// selector. Validate the shape before any mutating Notion API request.
+const QUICK_FILTERS_SCHEMA = z.record(z.string().min(1), z.unknown()).superRefine((input, ctx) => {
+  for (const [property, condition] of Object.entries(input)) {
+    if (!condition || typeof condition !== "object" || Array.isArray(condition) ||
+        Object.keys(condition).length === 0 ||
+        Object.prototype.hasOwnProperty.call(condition, "property") ||
+        Object.prototype.hasOwnProperty.call(condition, "and") ||
+        Object.prototype.hasOwnProperty.call(condition, "or")) {
+      ctx.addIssue({ code: "custom", path: [property],
+        message: "A quick filter must be a nonempty property condition without property/and/or." });
+    }
+  }
+});
+
 // Compile the typed `where` DSL into a Notion filter, or pass `filter` through.
 function compileViewFilter(
   where: unknown,
@@ -188,6 +204,19 @@ function canonicalViewFilter(
     );
   };
   return stableStringify(normalize(filter ?? null));
+}
+
+// Quick-filter keys, unlike advanced-filter values, are themselves property
+// identifiers. Compare them using the same name/ID schema normalization.
+function canonicalQuickFilters(
+  value: unknown,
+  properties: Record<string, { id?: string }> = {}
+): string {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return stableStringify([]);
+  const entries = Object.entries(value as Record<string, unknown>)
+    .map(([property, condition]) => canonicalViewFilter({ property, condition }, properties))
+    .sort();
+  return stableStringify(entries);
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -475,6 +504,7 @@ const CreateViewParams = z.object({
     "Typed filter DSL (same shape as query_database `where`). Mutually exclusive with `filter`."
   ),
   filter: z.unknown().optional().describe("Raw Notion view filter JSON. Mutually exclusive with `where`."),
+  quick_filters: QUICK_FILTERS_SCHEMA.optional().describe("Pinned view filter-bar conditions by property name or ID, separate from advanced filter."),
   sorts: z.array(z.unknown()).optional(),
   configuration: z
     .unknown()
@@ -488,7 +518,7 @@ register({
   access: "write",
   domain: "views",
   description:
-    "Create a database view, or add a filtered widget to an existing Dashboard with view_id, data_source_id and optional placement. Honors 4-per-row/12-total limits.",
+    "Create a database view or Dashboard widget with advanced filters, pinned quick filters and optional placement. Honors 4-per-row/12-total limits.",
   batchable: true,
   schema: CreateViewParams,
   example: {
@@ -509,7 +539,7 @@ register({
   },
   handler: tryHandler(async ({
     data_source_id, database_id, view_id, placement,
-    name, type, where, filter, sorts, configuration, verbose,
+    name, type, where, filter, quick_filters, sorts, configuration, verbose,
   }) => {
     if (REQUIRES_CONFIG[type] && configuration === undefined) {
       return { ok: false, error: {
@@ -549,6 +579,7 @@ register({
       name,
       type,
       ...(compiled.filter !== undefined ? { filter: compiled.filter } : {}),
+      ...(quick_filters !== undefined ? { quick_filters } : {}),
       ...(sorts !== undefined ? { sorts } : {}),
       ...(configuration !== undefined ? { configuration } : {}),
     };
@@ -565,7 +596,7 @@ register({
 // type and filter before creating. Same-name mismatches are an explicit HOLD.
 const EnsureDashboardWidgetParams = CreateViewParams.pick({
   view_id: true, data_source_id: true, placement: true,
-  name: true, type: true, where: true, filter: true,
+  name: true, type: true, where: true, filter: true, quick_filters: true,
   sorts: true, configuration: true, verbose: true,
 }).extend({
   view_id: notionId("view"),
@@ -577,7 +608,7 @@ register({
   name: "ensure_dashboard_widget",
   access: "write",
   domain: "views",
-  description: "Idempotently reconcile one named Dashboard widget by membership, data source, type and filter. A mismatched same-name widget is a conflict, not a duplicate opportunity.",
+  description: "Idempotently reconcile one named Dashboard widget by membership, source, type, advanced filter and pinned quick filters. A same-name mismatch is a conflict, not permission to create duplicates.",
   batchable: true,
   schema: EnsureDashboardWidgetParams,
   example: {
@@ -589,7 +620,7 @@ register({
   // failure of another batch item would be destructive.
   handler: tryHandler(async ({
     view_id, data_source_id, placement, name, type, where, filter,
-    sorts, configuration, verbose, dry_run,
+    quick_filters, sorts, configuration, verbose, dry_run,
   }): Promise<OperationResult<unknown>> => {
     if (type === "dashboard") return { ok: false, error: {
       code: "nested_dashboard_not_supported",
@@ -620,13 +651,14 @@ register({
     );
     const fullViews = existingViews as Array<{
       id: string; name?: string; type?: string; data_source_id?: string;
-      filter?: unknown; dashboard_view_id?: string;
+      filter?: unknown; quick_filters?: unknown; dashboard_view_id?: string;
     }>;
     const sameName = fullViews.filter((item) => item.name === name);
     // A saved filter can refer to an ID while the input used a property name.
     // Resolve the source schema only when comparing an existing named widget.
     const needsPropertyMapping = sameName.length > 0 &&
-      (compiled.filter != null || sameName.some((item) => item.filter != null));
+      (compiled.filter != null || quick_filters != null ||
+       sameName.some((item) => item.filter != null || item.quick_filters != null));
     const source = needsPropertyMapping
       ? await notion.dataSources.retrieve({ data_source_id })
       : null;
@@ -634,14 +666,16 @@ register({
       properties?: Record<string, { id?: string }>
     } | null)?.properties ?? {};
     const expectedFilter = canonicalViewFilter(compiled.filter, properties);
+    const expectedQuickFilters = canonicalQuickFilters(quick_filters, properties);
     const matches = sameName.filter((item) =>
       item.type === type && item.data_source_id === data_source_id &&
-      canonicalViewFilter(item.filter, properties) === expectedFilter
+      canonicalViewFilter(item.filter, properties) === expectedFilter &&
+      canonicalQuickFilters(item.quick_filters, properties) === expectedQuickFilters
     );
     if (sameName.length > 0 && (sameName.length !== 1 || matches.length !== 1))
       return { ok: false, error: {
         code: "dashboard_widget_conflict",
-        message: `Widget "${name}" exists with different source, type or filter (or is duplicated).`,
+        message: `Widget "${name}" exists with different source, type, filter or quick filters (or is duplicated).`,
         fix: "Inspect the existing widget and reconcile the intended source/filter before creating.",
       } };
     if (matches.length === 1) return {
@@ -657,6 +691,7 @@ register({
       view_id, data_source_id, name, type,
       ...(placement ? { placement } : {}),
       ...(compiled.filter !== undefined ? { filter: compiled.filter } : {}),
+      ...(quick_filters !== undefined ? { quick_filters } : {}),
       ...(sorts ? { sorts } : {}),
       ...(configuration !== undefined ? { configuration } : {}),
     }));
@@ -688,10 +723,11 @@ const UpdateViewParams = z.object({
     "Replace the view filter (typed DSL). Mutually exclusive with `filter`."
   ),
   filter: z.unknown().optional().describe("Replace the view filter (raw JSON). Mutually exclusive with `where`."),
+  quick_filters: QUICK_FILTERS_SCHEMA.optional().describe("Replace pinned quick filters by property name or ID."),
   sorts: z.array(z.unknown()).optional(),
   configuration: z.unknown().optional(),
   clear: z
-    .array(z.enum(["filter", "sorts", "configuration"]))
+    .array(z.enum(["filter", "quick_filters", "sorts", "configuration"]))
     .optional()
     .describe("Fields to clear (set to null)."),
   verbose: VERBOSE,
@@ -702,20 +738,27 @@ register({
   access: "write",
   domain: "views",
   description:
-    "Update a view's name/filter/sorts/configuration. Use `clear` to remove filter/sorts/configuration.",
+    "Update a view's name, advanced/quick filters, sorts and configuration. Use clear to explicitly remove a saved field.",
   batchable: true,
   schema: UpdateViewParams,
   example: { view_id: "<view-id>", name: "Renamed" },
-  handler: tryHandler(async ({ view_id, name, where, filter, sorts, configuration, clear, verbose }) => {
+  handler: tryHandler(async ({ view_id, name, where, filter, quick_filters, sorts, configuration, clear, verbose }) => {
     const compiled = compileViewFilter(where, filter);
     if (!compiled.ok) return { ok: false, error: compiled.error };
     const toClear = new Set(clear ?? []);
+    if (quick_filters !== undefined && toClear.has("quick_filters")) return {
+      ok: false, error: { code: "quick_filter_conflict",
+        message: "Cannot replace and clear quick_filters in the same request.",
+        fix: "Pass quick_filters or clear:['quick_filters'], not both." },
+    };
     const body: Record<string, unknown> = { view_id };
     if (name !== undefined) body.name = name;
     if (compiled.filter !== undefined) body.filter = compiled.filter;
+    if (quick_filters !== undefined) body.quick_filters = quick_filters;
     if (sorts !== undefined) body.sorts = sorts;
     if (configuration !== undefined) body.configuration = configuration;
     if (toClear.has("filter")) body.filter = null;
+    if (toClear.has("quick_filters")) body.quick_filters = null;
     if (toClear.has("sorts")) body.sorts = null;
     if (toClear.has("configuration")) body.configuration = null;
     const notion = await getClient();
