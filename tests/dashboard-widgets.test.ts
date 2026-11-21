@@ -192,6 +192,50 @@ describe("ensure_dashboard_widget", () => {
     expect(stub.views.create).not.toHaveBeenCalled();
   });
 
+  it("matches saved quick-filter property IDs to requested names", async () => {
+    stub.dataSources.retrieve.mockResolvedValue({
+      id: "source-1",
+      properties: { Status: { id: "%3DV%5BM", type: "select" } },
+    });
+    stub.views.retrieve.mockImplementation(async ({ view_id }) =>
+      view_id === "dash-1"
+        ? { ...dashboard(), configuration: { rows: [{ widgets: [{ view_id: "w-1" }] }] } }
+        : {
+            id: "w-1", name: "Open Items", type: "table",
+            data_source_id: "source-1",
+            quick_filters: { "=V[M": { select: { equals: "Open" } } },
+          }
+    );
+    const result = await dispatch("ensure_dashboard_widget", {
+      ...request, quick_filters: { Status: { select: { equals: "Open" } } },
+    });
+    expect(result).toMatchObject({ ok: true, data: { action: "existing" } });
+    expect(stub.dataSources.retrieve).toHaveBeenCalledTimes(1);
+    expect(stub.views.create).not.toHaveBeenCalled();
+  });
+
+  it("holds a same-name widget with mismatched quick filters", async () => {
+    stub.dataSources.retrieve.mockResolvedValue({
+      id: "source-1", properties: { Status: { id: "status" } },
+    });
+    stub.views.retrieve.mockImplementation(async ({ view_id }) =>
+      view_id === "dash-1"
+        ? { ...dashboard(), configuration: { rows: [{ widgets: [{ view_id: "w-1" }] }] } }
+        : {
+            id: "w-1", name: "Open Items", type: "table",
+            data_source_id: "source-1",
+            quick_filters: { status: { select: { equals: "Closed" } } },
+          }
+    );
+    const result = await dispatch("ensure_dashboard_widget", {
+      ...request, quick_filters: { Status: { select: { equals: "Open" } } },
+    });
+    expect(result).toMatchObject({
+      ok: false, error: { code: "dashboard_widget_conflict" },
+    });
+    expect(stub.views.create).not.toHaveBeenCalled();
+  });
+
   it("holds a same-name widget with mismatched source", async () => {
     stub.views.retrieve.mockImplementation(async ({ view_id }) =>
       view_id === "dash-1"
