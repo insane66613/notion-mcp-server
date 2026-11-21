@@ -127,8 +127,10 @@ async function resolveViewTarget(
 // Saved quick filters are keyed by data-source property name or ID.
 // Their values are property-filter conditions without a nested "property"
 // selector. Validate the shape before any mutating Notion API request.
-const QUICK_FILTERS_SCHEMA = z.record(z.string().min(1), z.unknown()).superRefine((input, ctx) => {
+const quickFiltersSchema = (allowSelectiveClear: boolean) =>
+  z.record(z.string().min(1), z.unknown()).superRefine((input, ctx) => {
   for (const [property, condition] of Object.entries(input)) {
+    if (allowSelectiveClear && condition === null) continue;
     if (!condition || typeof condition !== "object" || Array.isArray(condition) ||
         Object.keys(condition).length === 0 ||
         Object.prototype.hasOwnProperty.call(condition, "property") ||
@@ -139,6 +141,8 @@ const QUICK_FILTERS_SCHEMA = z.record(z.string().min(1), z.unknown()).superRefin
     }
   }
 });
+const QUICK_FILTERS_SCHEMA = quickFiltersSchema(false);
+const QUICK_FILTER_PATCH_SCHEMA = quickFiltersSchema(true);
 
 // Compile the typed `where` DSL into a Notion filter, or pass `filter` through.
 function compileViewFilter(
@@ -723,7 +727,9 @@ const UpdateViewParams = z.object({
     "Replace the view filter (typed DSL). Mutually exclusive with `filter`."
   ),
   filter: z.unknown().optional().describe("Replace the view filter (raw JSON). Mutually exclusive with `where`."),
-  quick_filters: QUICK_FILTERS_SCHEMA.optional().describe("Replace pinned quick filters by property name or ID."),
+  quick_filters: QUICK_FILTER_PATCH_SCHEMA.optional().describe(
+    "Patch pinned quick filters by property name or ID. Omitted keys are preserved; null removes one key. To clear all, use clear:['quick_filters']."
+  ),
   sorts: z.array(z.unknown()).optional(),
   configuration: z.unknown().optional(),
   clear: z
@@ -738,7 +744,7 @@ register({
   access: "write",
   domain: "views",
   description:
-    "Update a view's name, advanced/quick filters, sorts and configuration. Use clear to explicitly remove a saved field.",
+    "Update a view's name, advanced filter, pinned quick filter keys, sorts and configuration. Quick filter keys are patched (not replaced); null removes one, clear removes all.",
   batchable: true,
   schema: UpdateViewParams,
   example: { view_id: "<view-id>", name: "Renamed" },

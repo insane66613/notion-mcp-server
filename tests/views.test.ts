@@ -372,6 +372,7 @@ describe("create_view", () => {
       { Status: {} }, { Status: { property: "Status", status: { equals: "Done" } } },
       { Status: { and: [{ status: { equals: "Done" } }] } },
       { Status: "Done" },
+      { Status: null },
     ]) {
       const res = await dispatch("create_view", {
         data_source_id: "ds-1", name: "Bad", type: "table", quick_filters,
@@ -460,6 +461,42 @@ describe("update_view", () => {
     });
     expect(cleared).toMatchObject({ ok: true });
     expect(calls[1].args).toMatchObject({ view_id: "v-1", quick_filters: null });
+  });
+
+  it("patches individual quick filter keys while preserving omitted keys", async () => {
+    const saved: Record<string, unknown> = {
+      Status: { status: { equals: "Open" } },
+      Owner: { people: { contains: "user-1" } },
+    };
+    notionStub.views.update.mockImplementation(async (args) => {
+      calls.push({ method: "views.update", args });
+      for (const [key, value] of Object.entries(args.quick_filters ?? {})) {
+        if (value === null) delete saved[key];
+        else saved[key] = value;
+      }
+      return { id: "v-1", type: "table", quick_filters: { ...saved } };
+    });
+    const changed = await dispatch("update_view", {
+      view_id: "v-1", quick_filters: { Status: { status: { equals: "Done" } } },
+    }) as { ok: boolean; data: { quick_filters: Record<string, unknown> } };
+    expect(changed.ok).toBe(true);
+    expect(changed.data.quick_filters).toHaveProperty("Owner");
+    expect(changed.data.quick_filters).toHaveProperty("Status");
+    const removed = await dispatch("update_view", {
+      view_id: "v-1", quick_filters: { Status: null },
+    }) as { ok: boolean; data: { quick_filters: Record<string, unknown> } };
+    expect(removed.ok).toBe(true);
+    expect(calls[1].args).toMatchObject({ quick_filters: { Status: null } });
+    expect(removed.data.quick_filters).toHaveProperty("Owner");
+    expect(removed.data.quick_filters).not.toHaveProperty("Status");
+  });
+
+  it("rejects invalid quick filter conditions even during a patch", async () => {
+    for (const value of [[], {}, "Done", { property: "Status" }]) {
+      const res = await dispatch("update_view", { view_id: "v-1", quick_filters: { Status: value } });
+      expect(res).toMatchObject({ ok: false });
+    }
+    expect(notionStub.views.update).not.toHaveBeenCalled();
   });
 
   it("rejects simultaneous clear and replacement of quick filters", async () => {

@@ -214,6 +214,15 @@ describe("ensure_dashboard_widget", () => {
     expect(stub.views.create).not.toHaveBeenCalled();
   });
 
+  it("rejects null quick-filter conditions for widget creation", async () => {
+    const result = await dispatch("ensure_dashboard_widget", {
+      ...request, quick_filters: { Status: null }, dry_run: true,
+    });
+    expect(result).toMatchObject({ ok: false });
+    expect(stub.views.create).not.toHaveBeenCalled();
+    expect(stub.views.retrieve).not.toHaveBeenCalled();
+  });
+
   it("holds a same-name widget with mismatched quick filters", async () => {
     stub.dataSources.retrieve.mockResolvedValue({
       id: "source-1", properties: { Status: { id: "status" } },
