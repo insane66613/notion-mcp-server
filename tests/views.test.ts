@@ -436,3 +436,58 @@ describe("delete_view", () => {
     expect(calls[0]).toMatchObject({ method: "views.delete", args: { view_id: "v-1" } });
   });
 });
+
+describe("quick_filters parity across v3.6 view writes", () => {
+  it("forwards pinned filters when creating a view", async () => {
+    notionStub.views.create.mockResolvedValue({ id: "created", type: "table", name: "Open" });
+    const quick_filters = { Status: { status: { equals: "Open" } } };
+    const res = await dispatch("create_view", {
+      data_source_id: "source1", database_id: "db1",
+      name: "Open", type: "table", quick_filters,
+    });
+    expect(res.ok).toBe(true);
+    expect(notionStub.views.create).toHaveBeenCalledWith(
+      expect.objectContaining({ quick_filters })
+    );
+  });
+
+  it("rejects forbidden selector structures before a Notion write", async () => {
+    const invalid = await dispatch("create_view", {
+      data_source_id: "source1", database_id: "db1",
+      name: "Open", type: "table", quick_filters: {
+        Status: { property: "Status", status: { equals: "Open" } },
+      },
+    });
+    expect(invalid.ok).toBe(false);
+    expect(notionStub.views.create).not.toHaveBeenCalled();
+  });
+
+  it("patches selected filter keys and supports explicit full clear", async () => {
+    notionStub.views.update.mockResolvedValue({ id: "v-1", type: "table" });
+    const patch = { Status: null, Priority: { select: { equals: "High" } } };
+    const changed = await dispatch("update_view", { view_id: "v-1", quick_filters: patch });
+    expect(changed.ok).toBe(true);
+    expect(notionStub.views.update).toHaveBeenCalledWith(
+      expect.objectContaining({ view_id: "v-1", quick_filters: patch })
+    );
+    const cleared = await dispatch("update_view", {
+      view_id: "v-1", clear: ["quick_filters"],
+    });
+    expect(cleared.ok).toBe(true);
+    expect(notionStub.views.update).toHaveBeenCalledWith(
+      expect.objectContaining({ view_id: "v-1", quick_filters: null })
+    );
+  });
+
+  it("refuses contradictory patch and clear in one operation", async () => {
+    const result = await dispatch("update_view", {
+      view_id: "v-1",
+      quick_filters: { Status: { select: { equals: "Open" } } },
+      clear: ["quick_filters"],
+    });
+    expect(result).toMatchObject({
+      ok: false, error: { code: "quick_filter_conflict" },
+    });
+    expect(notionStub.views.update).not.toHaveBeenCalled();
+  });
+});

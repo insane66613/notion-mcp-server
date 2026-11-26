@@ -310,6 +310,40 @@ describe("ensure_dashboard_widget", () => {
     expect(stub.views.create).not.toHaveBeenCalled();
   });
 
+  it("reuses equivalent pinned quick filters under normalized property IDs", async () => {
+    stub.dataSources.retrieve.mockResolvedValue({
+      id: "source-1", properties: { Status: { id: "%3DV%5BM", type: "status" } },
+    });
+    stub.views.retrieve.mockImplementation(async ({ view_id }) =>
+      view_id === "dash-1"
+        ? { ...dashboard(), configuration: { rows: [{ widgets: [{ view_id: "w-1" }] }] } }
+        : {
+            id: "w-1", name: "Open Items", type: "table", data_source_id: "source-1",
+            filter: null,
+            quick_filters: { "=V[M": { status: { equals: "Open" } } },
+          }
+    );
+    const input = { ...request, quick_filters: { Status: { status: { equals: "Open" } } } };
+    const result = await dispatch("ensure_dashboard_widget", input);
+    expect(result).toMatchObject({ ok: true, data: { action: "existing" } });
+    const mismatch = await dispatch("ensure_dashboard_widget", {
+      ...request, quick_filters: { Status: { status: { equals: "Closed" } } },
+    });
+    expect(mismatch).toMatchObject({ ok: false, error: { code: "dashboard_widget_conflict" } });
+    expect(stub.views.create).not.toHaveBeenCalled();
+  });
+
+  it("creates a pinned quick-filter widget without weakening write serialization", async () => {
+    stub.views.retrieve.mockResolvedValue(dashboard([]));
+    stub.views.create.mockResolvedValue({
+      id: "new-pinned", name: "Open Items", type: "table", dashboard_view_id: "dash-1",
+    });
+    const quick_filters = { Status: { status: { equals: "Open" } } };
+    const res = await dispatch("ensure_dashboard_widget", { ...request, quick_filters });
+    expect(res).toMatchObject({ ok: true, data: { action: "created" } });
+    expect(stub.views.create).toHaveBeenCalledWith(expect.objectContaining({ quick_filters }));
+  });
+
   it("reuses status widgets for equivalent hinted and unhinted where", async () => {
     stub.dataSources.retrieve.mockResolvedValue({
       id: "source-1",
