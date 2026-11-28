@@ -13,7 +13,6 @@ import { CONFIG } from "../config/index.js";
 import { createServer, logAccessSummary, verifyNotionAuth } from "./index.js";
 import { checkAuth } from "./auth.js";
 import { log } from "../utils/log.js";
-import { NotionWebhookInbox, readWebhookBytes } from "./notion-webhook-ingest.js";
 
 // Streamable HTTP on `node:http`, serving two protocol eras side by side:
 //
@@ -226,11 +225,6 @@ export async function startHttp(
   const bindError = unauthenticatedBindError(config);
   if (bindError) throw new Error(bindError);
   setActiveTransport("http");
-  // The same managed HTTP listener owns the optional webhook inbox; no new
-  // server, port, agent orchestrator, or account selector is created.
-  const webhookInbox = config.webhooks
-    ? await NotionWebhookInbox.open(config.webhooks) : undefined;
-
   // Legacy leg: one transport per session; the connected server lives behind it.
   const transports: Record<string, NodeStreamableHTTPServerTransport> = {};
   // A 2025-era client that goes away without a DELETE would leave its session
@@ -310,7 +304,6 @@ export async function startHttp(
       });
     });
   } catch (error) {
-    await webhookInbox?.close();
     throw error;
   }
   const addr = httpServer.address();
@@ -344,34 +337,6 @@ export async function startHttp(
     if (req.method === "GET" && pathname === "/health") {
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ status: "healthy", transport: "http", port }));
-      return;
-    }
-
-    if (pathname.startsWith("/webhooks/notion/")) {
-      if (!webhookInbox || req.method !== "POST") {
-        await sendJsonRpcError(req, res, 404, -32601, "Not found");
-        return;
-      }
-      const rejection = hostOriginRejection(req, allowedHosts, allowedOrigins);
-      if (rejection) {
-        await sendJsonRpcError(req, res, 403, -32003, "Invalid webhook host");
-        return;
-      }
-      const route = pathname.slice("/webhooks/notion/".length);
-      let raw: Buffer;
-      try { raw = await readWebhookBytes(req); }
-      catch {
-        if (!res.headersSent && !res.writableEnded) {
-          res.writeHead(413, { "content-type": "application/json" });
-          res.end(JSON.stringify({ error: "Webhook body too large or unreadable" }));
-        }
-        return;
-      }
-      const signature = firstHeader(req.headers["x-notion-signature"]);
-      const outcome = await webhookInbox.accept(route, raw, signature);
-      res.writeHead(outcome.status, { "content-type": "application/json",
-        "cache-control": "no-store" });
-      res.end(JSON.stringify({ status: outcome.message }));
       return;
     }
 
@@ -511,14 +476,10 @@ export async function startHttp(
     // would otherwise be cut off by closeAllConnections below.
     await Promise.allSettled(Object.values(transports).map((t) => t.close()));
     await modern.close().catch(() => {});
-    try {
-      await new Promise<void>((resolve, reject) => {
-        httpServer.closeAllConnections?.();
-        httpServer.close((err) => (err ? reject(err) : resolve()));
-      });
-    } finally {
-      await webhookInbox?.close();
-    }
+    await new Promise<void>((resolve, reject) => {
+      httpServer.closeAllConnections?.();
+      httpServer.close((err) => (err ? reject(err) : resolve()));
+    });
   };
 
   return { port, close };

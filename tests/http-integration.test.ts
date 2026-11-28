@@ -111,6 +111,16 @@ describe("Streamable HTTP transport (no auth)", () => {
     expect(body.status).toBe("healthy");
   });
 
+  it("returns 404 for the retired Notion webhook route without affecting MCP", async () => {
+    const res = await fetch(`http://127.0.0.1:${noAuth.port}/webhooks/notion/synthetic`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ verification_token: "test-only" }),
+    });
+    expect(res.status).toBe(404);
+    const health = await fetch(`http://127.0.0.1:${noAuth.port}/health`);
+    expect(health.status).toBe(200);
+  });
+
   it("400s a POST with no session id and a non-initialize body", async () => {
     const res = await fetch(`http://127.0.0.1:${noAuth.port}/mcp`, {
       method: "POST",

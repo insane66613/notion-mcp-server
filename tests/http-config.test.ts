@@ -51,6 +51,12 @@ describe("parseHttpConfig", () => {
     expect(c.allowedOrigins).toEqual(["https://x.io"]);
   });
 
+  it("fails closed when retired Notion webhook configuration is supplied", () => {
+    expect(() => parseHttpConfig({ MCP_TRANSPORT: "http", NOTION_WEBHOOK_CONFIG_JSON: "{}" }))
+      .toThrow(/webhook ingestion has been retired/i);
+    expect(parseHttpConfig({ MCP_TRANSPORT: "http" })).not.toHaveProperty("webhooks");
+  });
+
   it("leaves allowed hosts/origins empty when unset (defaults are applied at bind time)", () => {
     const c = parseHttpConfig({});
     expect(c.allowedHosts).toEqual([]);
